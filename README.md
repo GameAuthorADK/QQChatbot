@@ -7,6 +7,10 @@
 > 完整中文使用手册见 [README.txt](README.txt)。  
 > 当前版本：0.2.7
 
+## 开发说明
+
+本项目在 AI 辅助下开发，代码经过人工测试与审核。使用前请自行评估是否符合你的使用场景。
+
 ## 功能
 
 - QQ 官方机器人网关（WebSocket），支持 @ 消息与群内全部消息
@@ -53,6 +57,21 @@ python -m venv .venv
 - 管理界面只监听 `127.0.0.1`，接口需要本地会话 Token
 - `config/`、`data/`、`logs/`、`runtime/`、`profiles/` 已加入 `.gitignore`，不会进入仓库
 
+## 第三方依赖
+
+主要依赖及许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+需要特别说明：
+
+- `pystray` 使用 LGPL-3.0，发布打包程序时应保留其许可证和源码地址
+- `PyInstaller` 使用 GPL-2.0-or-later（含 bootloader 例外）
+- WebView2 Runtime 使用系统已安装的微软组件，不随压缩包分发
+
+## 版权与规则包
+
+跑团规则包是对游戏规则的原创实现，只包含机制、字段、数值和简短说明，不包含规则书原文、表格或美术。  
+游戏名称、商标和规则书版权归各自权利人所有，本项目与各游戏发行商无关。
+
 ## 测试
 
 ```powershell
@@ -61,4 +80,6 @@ python -m venv .venv
 
 ## 许可证
 
-[MIT](LICENSE)
+- 本项目代码：[MIT](LICENSE)
+- 第三方组件：见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+- 跑团规则包中的游戏名称与商标归各自权利人所有
