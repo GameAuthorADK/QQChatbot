@@ -113,6 +113,9 @@ if ($hadStash) {
 }
 
 Copy-Item "README.txt" $dist -Force -ErrorAction SilentlyContinue
+Copy-Item "README.md" $dist -Force -ErrorAction SilentlyContinue
+Copy-Item "LICENSE" $dist -Force -ErrorAction SilentlyContinue
+Copy-Item "THIRD_PARTY_NOTICES.md" $dist -Force -ErrorAction SilentlyContinue
 
 # 5b) bundled documentation (read by the in-app Help tab)
 $docsDist = Join-Path $dist "docs"
@@ -157,6 +160,10 @@ if (Test-Path $bundled) {
                 Copy-Item $_.FullName $target -Force
                 Write-Host "  bundled rule plugin: $($_.Name)" -ForegroundColor DarkGray
             }
+        }
+        $trpgReadme = Join-Path $trpgSrc "README.md"
+        if (Test-Path $trpgReadme) {
+            Copy-Item $trpgReadme (Join-Path $trpgDist "README.md") -Force
         }
     }
 
