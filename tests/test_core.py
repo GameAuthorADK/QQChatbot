@@ -3844,11 +3844,11 @@ class TestBatchFeatures(unittest.TestCase):
 
         msg = GroupMessage("g", "m", "member", "id", "在吗", "", 0, mentioned=True)
         enabled.provider = Provider()
-        self.assertFalse(enabled._persona_check_due(msg, "chat"))
-        enabled._bump_persona_turn("g", "chat")
-        self.assertFalse(enabled._persona_check_due(msg, "chat"))
-        enabled._bump_persona_turn("g", "chat")
-        self.assertTrue(enabled._persona_check_due(msg, "chat"))
+        mem = enabled.persona_mem()
+        self.assertEqual(mem.bump_turn("g", "chat"), 1)
+        self.assertEqual(mem.bump_turn("g", "chat"), 2)
+        mem.reset_turn("g", "chat")
+        self.assertEqual(mem.get_turn("g", "chat"), 0)
         history = [{"role": "assistant", "content": "您好，请问有什么可以帮您？"}]
         note = asyncio.run(enabled._persona_check(msg, "chat", history))
         self.assertIn("客服腔", note)
@@ -3978,15 +3978,13 @@ class TestBatchFeatures(unittest.TestCase):
         rt.provider = Provider()
         a = GroupMessage("g", "m1", "member", "id1", "在吗", "", 0)
         b = GroupMessage("g", "m2", "member", "id2", "在吗", "", 0)
-        self.assertFalse(rt._persona_check_due(a, "chat"))
-        rt._bump_persona_turn("g", "chat")
-        self.assertFalse(rt._persona_check_due(b, "chat"))
-        # 第二个成员的消息也算同一群的对话量，不再按成员单独计数。
-        rt._bump_persona_turn("g", "chat")
-        self.assertTrue(rt._persona_check_due(b, "chat"))
+        mem = rt.persona_mem()
+        self.assertEqual(mem.bump_turn("g", "chat"), 1)
+        self.assertEqual(mem.bump_turn("g", "chat"), 2)
+        mem.reset_turn("g", "chat")
+        self.assertEqual(mem.get_turn("g", "chat"), 0)
 
         rt.cfg.persona_check_interval = 1
-        rt._bump_persona_turn("g", "chat")
         rt._remember_assistant("g", "您好，请问有什么可以帮您？")
         rt.store.append_turn("g", "m1", "在吗", "您好，请问有什么可以帮您？")
 
@@ -4165,6 +4163,21 @@ class TestBatchFeatures(unittest.TestCase):
         self.assertEqual(len(active), 10)
         stored = rt.persona_mem().reports(200)[0]["note"]
         self.assertEqual(len([x for x in stored.splitlines() if x.strip()]), 10)
+
+    def test_persona_turn_count_persists_across_restart(self):
+        rt = self._rt(
+            persona_guard_enabled=True,
+            persona_check_interval=5,
+        )
+        mem = rt.persona_mem()
+        self.assertEqual(mem.bump_turn("g", "chat"), 1)
+        self.assertEqual(mem.bump_turn("g", "chat"), 2)
+        rt._persona_mem_instance = None
+        mem2 = rt.persona_mem()
+        self.assertEqual(mem2.get_turn("g", "chat"), 2)
+        self.assertEqual(mem2.bump_turn("g", "chat"), 3)
+        mem2.reset_turn("g", "chat")
+        self.assertEqual(mem2.get_turn("g", "chat"), 0)
 
     def test_persona_reports_page(self):
         rt = self._rt()

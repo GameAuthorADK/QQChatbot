@@ -12,6 +12,7 @@ from .store import Store
 
 PLUGIN_ID = "persona"
 _REPORT_KEY = "reports"
+_TURN_KEY = "turns"
 DEFAULT_REPORT_LIMIT = 10
 MAX_TOTAL_REPORTS = 200
 MAX_NOTE_CHARS = 500
@@ -244,6 +245,47 @@ class PersonaMemory:
             key,
             json.dumps(data, ensure_ascii=False),
         )
+
+    def _turn_key(self, group: str, mode: str) -> str:
+        return f"{group}\x00{self._clean_mode(mode)}"
+
+    def _load_turns(self) -> dict:
+        raw = self.store.plugin_get(PLUGIN_ID, "global", _TURN_KEY)
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_turns(self, data: dict) -> None:
+        self.store.plugin_set(
+            PLUGIN_ID,
+            "global",
+            _TURN_KEY,
+            json.dumps(data, ensure_ascii=False),
+        )
+
+    def bump_turn(self, group: str, mode: str = "chat") -> int:
+        """持久化累计机器人自己的聊天回复数。"""
+        key = self._turn_key(group, mode)
+        with self._lock:
+            data = self._load_turns()
+            count = int(data.get(key) or 0) + 1
+            data[key] = count
+            self._save_turns(data)
+            return count
+
+    def reset_turn(self, group: str, mode: str = "chat") -> None:
+        key = self._turn_key(group, mode)
+        with self._lock:
+            data = self._load_turns()
+            if key in data:
+                data.pop(key, None)
+                self._save_turns(data)
+
+    def get_turn(self, group: str, mode: str = "chat") -> int:
+        with self._lock:
+            return int(self._load_turns().get(self._turn_key(group, mode)) or 0)
 
     def _load_reports(self) -> list:
         """补上旧报告缺少的 id；只保留聊天模式。"""

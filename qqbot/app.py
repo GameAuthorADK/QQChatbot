@@ -1823,7 +1823,6 @@ class Runtime:
             await sender.send_group_text(group, text)
             self.reply_count += 1
             self._remember_assistant(group, text)
-            self._bump_persona_turn(group, "chat")
             log.info("主动发言 group=%s len=%d", group[-4:], len(text))
             return True
         except Exception as exc:
@@ -2151,39 +2150,6 @@ class Runtime:
         buf = bufs.get(group)
         return list(buf)[-PERSONA_RECENT_MAX:] if buf else []
 
-    def _bump_persona_turn(self, group: str, mode: str) -> None:
-        """累计机器人自己的聊天回复数；其他模式不计。"""
-        if (str(mode or "chat")[:24] or "chat") != "chat":
-            return
-        counts = getattr(self, "_persona_turns", None)
-        if counts is None:
-            counts = {}
-            self._persona_turns = counts
-        key = (group, mode)
-        counts[key] = counts.get(key, 0) + 1
-
-    def _persona_check_due(self, target, mode: str) -> bool:
-        """按群累计机器人自己的回复数，达到设定条数后更新一次报告。"""
-        if not self.cfg.persona_guard_enabled:
-            return False
-        if (str(mode or "chat")[:24] or "chat") != "chat":
-            return False
-        interval = int(self.cfg.persona_check_interval or 0)
-        if interval <= 0:
-            return False
-        group = (
-            target if isinstance(target, str) else target.group_openid
-        )
-        counts = getattr(self, "_persona_turns", None)
-        if counts is None:
-            counts = {}
-            self._persona_turns = counts
-        key = (group, mode)
-        if int(counts.get(key) or 0) < interval:
-            return False
-        counts[key] = 0
-        return True
-
     async def _persona_check_report(
         self,
         group: str,
@@ -2374,7 +2340,20 @@ class Runtime:
         history: list[dict] | None = None,
     ) -> None:
         """自动自检放到后台，不阻塞当前回复。"""
+        if not self.cfg.persona_guard_enabled:
+            return
         if (str(mode or "chat")[:24] or "chat") != "chat":
+            return
+        interval = int(self.cfg.persona_check_interval or 0)
+        if interval <= 0:
+            return
+        mem = self.persona_mem()
+        try:
+            count = mem.bump_turn(group, mode)
+        except Exception:
+            log.warning("人设自检计数保存失败", exc_info=True)
+            return
+        if count < interval:
             return
         busy = getattr(self, "_persona_check_busy", None)
         if busy is None:
@@ -2383,21 +2362,30 @@ class Runtime:
         key = (group, mode)
         if key in busy:
             return
-        if not self._persona_check_due(group, mode):
-            return
+        try:
+            mem.reset_turn(group, mode)
+        except Exception:
+            log.warning("人设自检计数重置失败", exc_info=True)
         busy.add(key)
         recent_history = list(history or [])
+        log.info("人设自检触发 group=%s count=%d", group[-4:], count)
 
         async def _run() -> None:
             try:
-                await self._persona_check_report(
+                result = await self._persona_check_report(
                     group,
                     mode,
                     recent_history,
                     source="auto",
                 )
+                log.info(
+                    "人设自检完成 group=%s status=%s weight=%.1f",
+                    group[-4:],
+                    result.get("status"),
+                    float(result.get("weight") or 0),
+                )
             except Exception:
-                log.debug("人设自检异常", exc_info=True)
+                log.warning("人设自检异常", exc_info=True)
             finally:
                 busy.discard(key)
 
@@ -2599,7 +2587,6 @@ class Runtime:
         except Exception:
             pass
         self._remember_exchange(msg, mode, user_text, reply)
-        self._bump_persona_turn(msg.group_openid, mode)
         self._maybe_persona_check(
             msg.group_openid, mode, history
         )
