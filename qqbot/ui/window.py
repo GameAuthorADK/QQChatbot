@@ -115,6 +115,15 @@ def show_existing() -> bool:
 def _tray_image():
     from PIL import Image, ImageDraw
 
+    try:
+        from .icon import load_tray_image
+
+        loaded = load_tray_image(64)
+        if loaded is not None:
+            return loaded
+    except Exception:
+        pass
+
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.rounded_rectangle((4, 4, 60, 60), radius=16, fill=(45, 108, 223, 255))
@@ -230,7 +239,16 @@ def open_window(url: str, title: str = "QQChatbot", devtools: bool = False) -> N
             min_size=(820, 620),
         )
         api.window.events.closing += api._on_closing
-        webview.start(debug=devtools)
+        try:
+            from .icon import icon_path
+
+            icon_file = icon_path("ico")
+        except Exception:
+            icon_file = None
+        webview.start(
+            debug=devtools,
+            icon=str(icon_file) if icon_file is not None else None,
+        )
         if api.icon is not None:
             try:
                 api.icon.stop()

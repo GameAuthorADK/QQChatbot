@@ -123,10 +123,17 @@ INDEX_HTML = r"""<!doctype html>
   .membar { display:flex; align-items:center; justify-content:space-between;
             margin:18px 0 10px; padding-top:14px; border-top:1px solid #262a31; }
   .membar h3 { margin:0; font-size:12px; color:#8b93a1; font-weight:600; }
-  .memitem { border:1px solid #262a31; border-radius:8px; padding:10px 12px;
-             margin-bottom:8px; background:#17191f; }
+  .memlist { border:1px solid #262a31; border-radius:8px; background:#17191f;
+             overflow:hidden; }
+  .memitem { padding:10px 12px; border-bottom:1px solid #22262d; }
+  .memitem:last-child { border-bottom:0; }
   .memrow2 { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
-  .memtext { white-space:pre-wrap; font-size:13px; line-height:1.65; }
+  .memtextrow { display:flex; align-items:flex-start; gap:8px; }
+  .memtextrow .memtext { flex:1; min-width:0; margin-top:0; }
+  .memactions { display:flex; align-items:flex-start; gap:4px; flex-wrap:wrap;
+                justify-content:flex-end; flex-shrink:0; }
+  .pager { display:flex; align-items:center; gap:8px; margin-top:10px; }
+  .memtext { white-space:pre-wrap; font-size:13px; line-height:1.65; margin-top:6px; }
 
   .chatwrap { display:flex; flex-direction:column; height:calc(100vh - 132px); min-height:420px; }
   .chatlog { flex:1 1 auto; overflow:auto; padding:16px; background:#1b1e24;
@@ -353,7 +360,8 @@ INDEX_HTML = r"""<!doctype html>
         <h2>人设稳定</h2>
         <label class="chk"><input id="pgOn" type="checkbox"> 启用人设稳定</label>
         <p class="hint" style="margin-top:6px">
-          每轮固定注入人设锚点；每隔若干轮让模型检查最近回复是否跑偏，并记录自检报告。
+          每轮固定注入人设锚点；按群累计若干轮后让模型检查最近回复是否跑偏，并记录自检报告。
+          主动发言也会计入轮数。下方可以随时手动自检。
         </p>
         <div id="personaFields" style="margin-top:10px">
           <div class="field">
@@ -365,11 +373,11 @@ INDEX_HTML = r"""<!doctype html>
             </span>
           </div>
           <div class="field">
-            <label>每多少轮自检</label>
+            <label>每多少条机器人回复自检</label>
             <input id="pgCheck" type="number" min="0" max="200" step="5">
             <span class="hint">
-              每隔这么多轮，让模型检查最近回复有没有跑偏，并注入一句纠正提醒。
-              0 表示只做固定锚点，不额外调用模型。
+              按群累计机器人自己的回复和主动发言；达到后在下一次回复时更新报告。
+              0 表示只做固定锚点，不自动更新报告。
             </span>
           </div>
 
@@ -425,14 +433,22 @@ INDEX_HTML = r"""<!doctype html>
         <div class="membar" style="margin-top:16px">
           <h3>自检报告</h3>
           <div style="display:flex;align-items:center;gap:8px">
+            <button class="ghost mini" id="pgCheckNow">立即自检</button>
             <span id="pgReportsFileMsg" class="hint"></span>
             <button class="ghost mini" id="pgReportsExport">导出自检</button>
+            <select id="pgReportsImportMode" class="mini-sel" style="max-width:120px">
+              <option value="merge">合并追加</option>
+              <option value="replace">覆盖全部</option>
+            </select>
             <button class="ghost mini" id="pgReportsImportBtn">导入自检</button>
             <input id="pgReportsImport" type="file" accept=".json,application/json" style="display:none">
           </div>
         </div>
         <div id="pgReportsMsg" class="hint" style="margin-bottom:6px"></div>
+        <div class="hint" style="margin-bottom:6px">只记录聊天模式；报告可以多行，每行“- 内容（权重）”，括号缺失或数值不合法时该行不生效；每群最多 10 条问题内容，0.0 不占名额，最新一条始终保留。</div>
+        <div id="pgCheckMsg" class="hint" style="margin-bottom:6px"></div>
         <div id="pgReports"></div>
+        <div id="pgReportsPager" class="pager"></div>
       </section>
 
       <section>
@@ -469,6 +485,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </div>
         <div id="memList"></div>
+        <div id="memPager" class="pager"></div>
       </section>
     </div>
 
@@ -1095,6 +1112,12 @@ let PRESETS = [];
 let PROV = {};
 let ST = {};
 let RULES = [];
+let PERSONA_REPORTS = [];
+let PERSONA_EDIT = -1;
+let PERSONA_PAGE = 1;
+let PERSONA_PAGES = 1;
+let PERSONA_TOTAL = 0;
+const PERSONA_PAGE_SIZE = 10;
 let filled = { basic: false, global: false, persona: false, modes: false, plugins: false };
 let GROUP_REPLY_LOADED = false;
 let GROUP_REPLY_CURRENT = "";
@@ -1137,6 +1160,10 @@ document.querySelectorAll("aside .navmain button").forEach(btn => {
     document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
     btn.classList.add("active");
     $("tab-" + btn.dataset.tab).classList.add("active");
+    if (btn.dataset.tab === "persona") {
+      loadMemoryPage(MEM_PAGE);
+      loadReportsPage(PERSONA_PAGE);
+    }
   };
 });
 
@@ -1454,12 +1481,12 @@ async function refresh() {
       $("memCalc").textContent =
         `内置+固定提示词 ${fixed} token　·　按每个人、每种模式分别累计：` +
         `超出最近 ${hl} 条历史后，再攒到 ${s.memory.content_budget} token ` +
-        `或 ${(s.memory.trigger_messages || 60)} 条整理一次`;
+        `或 ${(s.memory.trigger_messages || 60)} 条整理一次；` +
+        `每条记忆最多 10 条（6 条最新对话 + 4 条长期保留）`;
       const pend = s.memory.pending || {};
       $("memPending").textContent = pend.messages
         ? `待整理：${pend.people || 0} 人 / ${pend.threads || 0} 个对话 / 共 ${pend.messages} 条`
         : "待整理：暂无（还没有攒到需要整理的旧对话）";
-      if (MEM_EDIT < 0) renderMemory(s.memory);
     }
 
     if (!filled.global) {
@@ -1517,7 +1544,6 @@ async function refresh() {
     }
     updateListenMasterHint($("lsOn").checked);
     updateProactiveMasterHint($("prActiveOn").checked);
-    renderPersonaReports(s.persona_reports || [], s.persona_issues || []);
 
     if (!filled.plugins) {
       filled.plugins = true;
@@ -1938,39 +1964,79 @@ $("winSave").onclick = async () => {
 
 let MEM = [];
 let MEM_EDIT = -1;
+let MEM_PAGE = 1;
+let MEM_PAGES = 1;
+let MEM_TOTAL = 0;
+const MEM_PAGE_SIZE = 10;
 
-function renderMemory(mem) {
-  MEM = (mem && mem.items) || [];
+function renderPager(id, page, pages, kind) {
+  const el = $(id);
+  if (!el) return;
+  if (pages <= 1) {
+    el.innerHTML = "";
+    return;
+  }
+  el.innerHTML =
+    `<button class="ghost mini" data-pager="${kind}" data-dir="-1" ${page <= 1 ? "disabled" : ""}>上一页</button>` +
+    `<span class="hint">第 ${page} / ${pages} 页</span>` +
+    `<button class="ghost mini" data-pager="${kind}" data-dir="1" ${page >= pages ? "disabled" : ""}>下一页</button>`;
+}
+
+function renderMemory() {
   if (MEM_EDIT >= MEM.length) MEM_EDIT = -1;
-
   if (!MEM.length) {
     $("memList").innerHTML =
       `<span class="hint">还没有生成任何记忆。开启自动总结并积累对话后会自动出现。</span>`;
+    renderPager("memPager", 1, 1, "mem");
     return;
   }
 
-  $("memList").innerHTML = MEM.map((it, i) => {
+  const rows = MEM.map((it, i) => {
+    const summary = String(it.summary || "").trim();
+    const display = summary
+      ? (summary.startsWith("-") ? summary : "- " + summary)
+      : "- （无记忆内容）";
     const head = `<div class="memrow2">
         <code style="color:#8b93a1">…${it.group.slice(-6)} / …${it.member.slice(-6)}</code>
         <span class="tag mode">${esc(it.mode || "chat")}</span>
-        <span style="flex:1"></span>`;
+      </div>`;
     if (i === MEM_EDIT) {
       return `<div class="memitem">
         ${head}
-          <button class="mini" data-save="${i}">保存</button>
-          <button class="mini ghost" data-cancel="${i}">取消</button>
+        <div class="memtextrow">
+          <textarea data-editbox="${i}" rows="4" style="flex:1;min-width:0">${esc(it.summary)}</textarea>
+          <div class="memactions">
+            <button class="mini" data-save="${i}">保存</button>
+            <button class="mini ghost" data-cancel="${i}">取消</button>
+          </div>
         </div>
-        <textarea data-editbox="${i}" rows="4" style="margin-top:6px">${esc(it.summary)}</textarea>
       </div>`;
     }
     return `<div class="memitem">
       ${head}
-        <button class="mini ghost" data-edit="${i}">编辑</button>
-        <button class="mini ghost" data-remove="${i}">删除</button>
+      <div class="memtextrow">
+        <div class="memtext">${esc(display)}</div>
+        <div class="memactions">
+          <button class="mini ghost" data-edit="${i}">编辑</button>
+          <button class="mini ghost" data-remove="${i}">删除</button>
+        </div>
       </div>
-      <div class="memtext">${esc(it.summary)}</div>
     </div>`;
   }).join("");
+  $("memList").innerHTML = `<div class="memlist">${rows}</div>`;
+  renderPager("memPager", MEM_PAGE, MEM_PAGES, "mem");
+}
+
+async function loadMemoryPage(page) {
+  if (MEM_EDIT >= 0) return;
+  try {
+    const r = await api(`/api/memory/page?page=${page}&size=${MEM_PAGE_SIZE}`);
+    MEM = r.items || [];
+    MEM_PAGE = r.page || 1;
+    MEM_PAGES = r.pages || 1;
+    MEM_TOTAL = r.total || 0;
+    renderMemory();
+  } catch (e) { /* 保持当前页 */ }
 }
 
 $("memList").addEventListener("click", async (e) => {
@@ -1978,8 +2044,8 @@ $("memList").addEventListener("click", async (e) => {
   if (!b) return;
   const d = b.dataset;
 
-  if (d.edit !== undefined) { MEM_EDIT = Number(d.edit); renderMemory({ items: MEM }); return; }
-  if (d.cancel !== undefined) { MEM_EDIT = -1; renderMemory({ items: MEM }); return; }
+  if (d.edit !== undefined) { MEM_EDIT = Number(d.edit); renderMemory(); return; }
+  if (d.cancel !== undefined) { MEM_EDIT = -1; renderMemory(); return; }
 
   if (d.save !== undefined) {
     const i = Number(d.save);
@@ -1991,7 +2057,7 @@ $("memList").addEventListener("click", async (e) => {
         group: MEM[i].group, member: MEM[i].member, mode: MEM[i].mode || "chat", summary: text,
       })});
       MEM_EDIT = -1;
-      await refresh();
+      await loadMemoryPage(MEM_PAGE);
     } catch (err) { alert("保存失败：" + err.message); }
     return;
   }
@@ -2004,9 +2070,16 @@ $("memList").addEventListener("click", async (e) => {
         group: MEM[i].group, member: MEM[i].member, mode: MEM[i].mode || "chat",
       })});
       MEM_EDIT = -1;
-      await refresh();
+      await loadMemoryPage(MEM_PAGE);
     } catch (err) { alert("删除失败：" + err.message); }
   }
+});
+
+$("memPager").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-pager]");
+  if (!b || MEM_EDIT >= 0) return;
+  MEM_PAGE += Number(b.dataset.dir) || 0;
+  await loadMemoryPage(MEM_PAGE);
 });
 
 $("memSave").onclick = async () => {
@@ -2044,6 +2117,7 @@ $("memSummarize").onclick = async () => {
       ? `已整理 ${r.summarized} 个对话` + (left ? `，还有 ${left} 个对话待整理` : "")
       : (r.failed ? "整理失败，待处理内容已保留" : "没有可整理的对话");
     await refresh();
+    await loadMemoryPage(MEM_PAGE);
   } catch (e) {
     $("memSumMsg").textContent = "整理失败：" + e.message;
   } finally {
@@ -2061,7 +2135,9 @@ $("memImport").addEventListener("change", async (e) => {
     const payload = JSON.parse(await f.text());
     const r = await api("/api/memory/import", { method: "POST", body: JSON.stringify({ data: payload }) });
     filled.persona = false;
+    MEM_PAGE = 1;
     await refresh();
+    await loadMemoryPage(1);
     $("memFileMsg").textContent = `已导入，恢复 ${r.restored || 0} 条记忆`;
   } catch (err) { $("memFileMsg").textContent = "导入失败：" + err.message; }
 });
@@ -2596,47 +2672,207 @@ $("pgCopy").onclick = () => {
   applyPgPreset(false);
 };
 
-function renderPersonaReports(items, issues = []) {
-  const reportCount = items.length ? `最近 ${items.length} 条报告` : "";
-  const issueCount = issues.length ? `${issues.length} 条重点问题` : "";
-  $("pgReportsMsg").textContent = [reportCount, issueCount].filter(Boolean).join(" · ");
-  if (!items.length && !issues.length) {
+function reportText(r) {
+  const raw = String(r.note || "").trim();
+  const fallback = Number(r.weight) || 0;
+  if (!raw) return `- （无报告文字）（${fallback.toFixed(1)}）`;
+  const lines = raw.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  const parsed = lines.map(line => {
+    const m = line.match(/^(.*?)[（(]\s*([0-9]+(?:\.[0-9]+)?)\s*[）)]\s*$/);
+    const value = m ? Number(m[2]) : NaN;
+    const valid = m && value >= 0 && value <= 1;
+    return {
+      line,
+      content: m ? m[1].trim() : line.replace(/^[-*•]\s*/, ""),
+      weight: valid ? value : null,
+    };
+  });
+  const anyValid = parsed.some(x => x.weight !== null);
+  const hasParen = lines.some(x => /[（(].*[）)]/.test(x));
+  if (!anyValid && fallback > 0 && !hasParen) {
+    const body = parsed.map(x => x.content).join("\n");
+    return `- ${body}（${fallback.toFixed(1)}）`;
+  }
+  return parsed.map(x => {
+    const prefix = /^[-*•]/.test(x.line) ? x.line : "- " + x.line;
+    if (x.weight === null) return prefix + "（不生效）";
+    return prefix;
+  }).join("\n");
+}
+
+function hasValidReportWeight(text) {
+  return String(text || "").split(/\r?\n/).some(line => {
+    const m = line.trim().match(/[（(]\s*([0-9]+(?:\.[0-9]+)?)\s*[）)]\s*$/);
+    if (!m) return false;
+    const value = Number(m[1]);
+    return value >= 0 && value <= 1;
+  });
+}
+
+function renderPersonaReports(force = false) {
+  if (PERSONA_EDIT >= 0 && !force) return;
+  if (PERSONA_EDIT >= PERSONA_REPORTS.length) PERSONA_EDIT = -1;
+  $("pgReportsMsg").textContent =
+    PERSONA_TOTAL ? `共 ${PERSONA_TOTAL} 条报告` : "";
+  if (!PERSONA_REPORTS.length) {
     $("pgReports").innerHTML =
-      `<span class="hint">还没有自检报告。启用后达到自检轮数才会产生。</span>`;
+      `<span class="hint">还没有自检报告。启用后达到自检条数会自动产生，也可以点「立即自检」。</span>`;
+    renderPager("pgReportsPager", 1, 1, "reports");
     return;
   }
-  const issueHtml = issues.length
-    ? `<div style="margin:0 0 8px">
-         <strong style="font-size:12px;color:#8b93a1">重点问题（按权重）</strong>
-       </div>` +
-      issues.map(i => `
-        <div style="border:1px solid #262a31;border-radius:8px;padding:8px;margin-bottom:8px">
-          <div class="grow">
-            <span class="tag disabled">权重 ${Number(i.weight) || 0}</span>
-            <span class="hint">出现 ${Number(i.count) || 0} 次</span>
+  const rows = PERSONA_REPORTS.map((r, i) => {
+    const time = new Date((r.ts || 0) * 1000).toLocaleString();
+    const status = r.status === "drift" ? "drift"
+      : r.status === "error" ? "error" : "ok";
+    const label = status === "drift" ? "跑偏"
+      : status === "error" ? "异常" : "正常";
+    const cls = status === "drift" ? "disabled"
+      : status === "error" ? "disabled" : "active";
+    const source = r.source === "manual" ? "手动" : "自动";
+    const head = `<div class="memrow2">
+        <code style="color:#8b93a1">群…${esc(String(r.group || "").slice(-8))}</code>
+        <span class="tag mode">${esc(r.mode || "chat")}</span>
+        <span class="tag ${cls}">${label}</span>
+        <span class="hint">${source} · ${esc(time)}</span>
+      </div>`;
+    if (i === PERSONA_EDIT) {
+      return `<div class="memitem">
+        ${head}
+        <div class="memtextrow">
+          <div style="flex:1;min-width:0">
+            <textarea id="pnote-${i}" rows="4" maxlength="500" style="width:100%"
+              placeholder="每行一条，格式：- 问题内容（权重）；括号缺失或数值不合法则不生效">${esc(r.note || "")}</textarea>
           </div>
-          <div class="hint" style="margin-top:4px">${esc(i.text || "")}</div>
-        </div>`).join("")
-    : "";
-  const reportHtml = items.length
-    ? `<div style="margin:10px 0 8px">
-         <strong style="font-size:12px;color:#8b93a1">最近报告</strong>
-       </div>` +
-      items.map(r => {
-        const time = new Date((r.ts || 0) * 1000).toLocaleString();
-        const drift = r.status === "drift";
-        return `<div style="border:1px solid #262a31;border-radius:8px;padding:8px;margin-bottom:8px">
-          <div class="grow">
-            <code style="color:#8b93a1">${esc(time)}</code>
-            <span class="tag ${drift ? "disabled" : "active"}">${drift ? "跑偏" : "正常"}</span>
-            <span class="hint">群${esc(String(r.group || "").slice(-6))} / 人${esc(String(r.member || "").slice(-6))} / ${esc(r.mode || "chat")}</span>
+          <div class="memactions">
+            <button class="mini" data-psave="${i}">保存</button>
+            <button class="mini ghost" data-pcancel="${i}">取消</button>
+            <span id="pmsg-${i}" class="hint"></span>
           </div>
-          ${r.note ? `<div class="hint" style="margin-top:4px">${esc(r.note)}</div>` : ""}
-        </div>`;
-      }).join("")
-    : "";
-  $("pgReports").innerHTML = issueHtml + reportHtml;
+        </div>
+      </div>`;
+    }
+    return `<div class="memitem">
+      ${head}
+      <div class="memtextrow">
+        <div class="memtext">${esc(reportText(r))}</div>
+        <div class="memactions">
+          <button class="mini ghost" data-pedit="${i}">编辑</button>
+          <button class="mini ghost" data-pdelete="${i}">删除</button>
+          <button class="mini ghost" data-pclear="${i}">清空本群</button>
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+  $("pgReports").innerHTML = `<div class="memlist">${rows}</div>`;
+  renderPager("pgReportsPager", PERSONA_PAGE, PERSONA_PAGES, "reports");
 }
+
+async function loadReportsPage(page) {
+  if (PERSONA_EDIT >= 0) return;
+  try {
+    const r = await api(`/api/persona/reports/page?page=${page}&size=${PERSONA_PAGE_SIZE}`);
+    PERSONA_REPORTS = r.items || [];
+    PERSONA_PAGE = r.page || 1;
+    PERSONA_PAGES = r.pages || 1;
+    PERSONA_TOTAL = r.total || 0;
+    renderPersonaReports();
+  } catch (e) { /* 保持当前页 */ }
+}
+
+$("pgReports").addEventListener("click", async (e) => {
+  const edit = e.target.closest("[data-pedit]");
+  if (edit) {
+    PERSONA_EDIT = Number(edit.getAttribute("data-pedit"));
+    renderPersonaReports(true);
+    return;
+  }
+  const cancel = e.target.closest("[data-pcancel]");
+  if (cancel) {
+    PERSONA_EDIT = -1;
+    renderPersonaReports(true);
+    return;
+  }
+  const save = e.target.closest("[data-psave]");
+  if (!save) return;
+  const idx = Number(save.getAttribute("data-psave"));
+  const report = PERSONA_REPORTS[idx];
+  if (!report) return;
+  const note = $("pnote-" + idx).value;
+  if (note.trim() && !hasValidReportWeight(note)) {
+    if (!confirm("没有检测到合法权重，保存后这条报告不会影响回复。仍要保存吗？")) return;
+  }
+  save.disabled = true;
+  $("pmsg-" + idx).textContent = "保存中…";
+  try {
+    const r = await api("/api/persona/reports/item", {
+      method: "POST", body: JSON.stringify({
+        id: report.id, note,
+      }),
+    });
+    PERSONA_EDIT = -1;
+    PERSONA_PAGE = 1;
+    await loadReportsPage(1);
+    $("pgReportsMsg").textContent += " · 已保存";
+  } catch (err) {
+    $("pmsg-" + idx).textContent =
+      (String(err.message || "").includes("没有找到"))
+        ? "报告已被删除或裁剪，内容仍保留，请复制后处理"
+        : "保存失败：" + err.message;
+  } finally {
+    save.disabled = false;
+  }
+});
+
+$("pgReports").addEventListener("click", async (e) => {
+  const clear = e.target.closest("[data-pclear]");
+  if (clear) {
+    const idx = Number(clear.getAttribute("data-pclear"));
+    const report = PERSONA_REPORTS[idx];
+    if (!report) return;
+    if (!confirm(`清空群…${String(report.group || "").slice(-8)} 的全部自检报告？`)) return;
+    clear.disabled = true;
+    try {
+      const r = await api("/api/persona/reports/clear", {
+        method: "POST", body: JSON.stringify({ group: report.group }),
+      });
+      PERSONA_EDIT = -1;
+      PERSONA_PAGE = 1;
+      await loadReportsPage(1);
+      $("pgReportsMsg").textContent += ` · 已清空 ${Number(r.removed) || 0} 条`;
+    } catch (err) {
+      $("pgReportsMsg").textContent = "清空失败：" + err.message;
+    } finally {
+      clear.disabled = false;
+    }
+    return;
+  }
+  const del = e.target.closest("[data-pdelete]");
+  if (!del) return;
+  const idx = Number(del.getAttribute("data-pdelete"));
+  const report = PERSONA_REPORTS[idx];
+  if (!report) return;
+  if (!confirm(`删除群…${String(report.group || "").slice(-8)} 的这条自检报告？`)) return;
+  del.disabled = true;
+  try {
+    const r = await api("/api/persona/reports/item/delete", {
+      method: "POST", body: JSON.stringify({ id: report.id }),
+    });
+    PERSONA_EDIT = -1;
+    await loadReportsPage(PERSONA_PAGE);
+    $("pgReportsMsg").textContent += " · 已删除";
+  } catch (err) {
+    $("pgReportsMsg").textContent = "删除失败：" + err.message;
+  } finally {
+    del.disabled = false;
+  }
+});
+
+$("pgReportsPager").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-pager]");
+  if (!b || PERSONA_EDIT >= 0) return;
+  PERSONA_PAGE += Number(b.dataset.dir) || 0;
+  await loadReportsPage(PERSONA_PAGE);
+});
 
 $("pgSave").onclick = async () => {
   $("pgSave").disabled = true;
@@ -2703,6 +2939,33 @@ $("pgPromptImportBtn").onclick = () => $("pgPromptImport").click();
 $("pgPromptImport").addEventListener("change", () =>
   importPrompt("persona_anchor", "pgPromptImport", "pgMsg"));
 
+$("pgCheckNow").onclick = async () => {
+  $("pgCheckNow").disabled = true;
+  $("pgCheckMsg").textContent = "自检中…";
+  try {
+    const r = await api("/api/persona/check", {
+      method: "POST", body: JSON.stringify({}),
+    });
+    if (!r.ok) {
+      $("pgCheckMsg").textContent = "自检失败：" + (r.error || "未知错误");
+      if (r.reports) await loadReportsPage(PERSONA_PAGE);
+      return;
+    }
+    const label = r.status === "drift" ? "跑偏"
+      : r.status === "error" ? "异常" : "正常";
+    $("pgCheckMsg").textContent =
+      `已自检：${label}（权重 ${(Number(r.weight) || 0).toFixed(1)}）` +
+      ` · 群…${String(r.group || "").slice(-8)} / ${String(r.mode || "chat")}` +
+      (r.note ? ` · ${r.note}` : "");
+    PERSONA_PAGE = 1;
+    await loadReportsPage(1);
+  } catch (e) {
+    $("pgCheckMsg").textContent = "自检失败：" + e.message;
+  } finally {
+    $("pgCheckNow").disabled = false;
+  }
+};
+
 $("pgReportsExport").onclick = async () => {
   try {
     const r = await api("/api/persona/reports/export");
@@ -2717,11 +2980,16 @@ $("pgReportsImport").addEventListener("change", async (e) => {
   if (!file) return;
   try {
     const payload = JSON.parse(await file.text());
-    await api("/api/persona/reports/import", {
-      method: "POST", body: JSON.stringify({ data: payload }),
+    const mode = $("pgReportsImportMode").value || "merge";
+    if (mode === "replace" && !confirm("覆盖导入会删除当前全部自检报告，确定继续吗？")) return;
+    const r = await api("/api/persona/reports/import", {
+      method: "POST", body: JSON.stringify({ data: payload, mode }),
     });
-    $("pgReportsFileMsg").textContent = "已导入自检报告";
+    $("pgReportsFileMsg").textContent =
+      `已导入（${mode === "replace" ? "覆盖" : "合并"}，新增 ${Number(r.added) || 0} 条）`;
+    PERSONA_PAGE = 1;
     await refresh();
+    await loadReportsPage(1);
   } catch (err) {
     $("pgReportsFileMsg").textContent = "导入失败：" + err.message;
   }
@@ -3276,7 +3544,10 @@ CHAT = [];
 renderChat();
 // 打开或刷新页面即清空试聊上下文，且试聊从不写入长期记忆
 api("/api/chat/preview/reset", { method: "POST" }).catch(() => {});
-loadPresets().then(refresh).catch(refresh);
+loadPresets().then(refresh).catch(refresh).then(() => {
+  loadMemoryPage(1);
+  loadReportsPage(1);
+});
 refreshLogs();
 setInterval(refresh, 2500);
 setInterval(refreshLogs, 5000);

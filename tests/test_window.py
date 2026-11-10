@@ -100,6 +100,18 @@ class TestWindowApi(unittest.TestCase):
     def test_find_hwnd_missing_title(self):
         self.assertEqual(window._find_hwnd("NoSuchWindow_QQBot_Test"), 0)
 
+    def test_icon_files_and_tray_image(self):
+        from qqbot.ui import icon
+
+        ico = icon.icon_path("ico")
+        png = icon.icon_path("png")
+        self.assertIsNotNone(ico)
+        self.assertTrue(ico.is_file())
+        self.assertIsNotNone(png)
+        self.assertTrue(png.is_file())
+        image = window._tray_image()
+        self.assertEqual(image.size, (64, 64))
+
 
 if __name__ == "__main__":
     unittest.main()

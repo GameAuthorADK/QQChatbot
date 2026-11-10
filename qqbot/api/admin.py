@@ -428,6 +428,18 @@ def create_app(rt: Runtime) -> FastAPI:
             "items": rt.store.list_summaries(),
         }
 
+    @app.get("/api/memory/page")
+    async def get_memory_page(request: Request, page: int = 1, size: int = 10):
+        guard(request)
+        items, total = rt.store.list_summaries_page(page, size)
+        pages = max(1, (total + max(1, min(50, size)) - 1) // max(1, min(50, size)))
+        return {
+            "items": items,
+            "total": total,
+            "page": min(max(1, page), pages),
+            "pages": pages,
+        }
+
     @app.post("/api/memory/item")
     async def set_memory_item(request: Request):
         guard(request)
@@ -573,6 +585,21 @@ def create_app(rt: Runtime) -> FastAPI:
             "effective": vars(rt.reply_settings(group_openid)),
         }
 
+    @app.get("/api/persona/reports/page")
+    async def get_persona_reports_page(
+        request: Request, page: int = 1, size: int = 10
+    ):
+        guard(request)
+        items, total = rt.persona_mem().reports_page(page, size)
+        size = max(1, min(50, size))
+        pages = max(1, (total + size - 1) // size)
+        return {
+            "items": items,
+            "total": total,
+            "page": min(max(1, page), pages),
+            "pages": pages,
+        }
+
     @app.get("/api/persona/reports/export")
     async def export_persona_reports(request: Request):
         guard(request)
@@ -582,8 +609,7 @@ def create_app(rt: Runtime) -> FastAPI:
             "format": "qqchatbot-persona-reports",
             "version": 1,
             "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "reports": rt.persona_mem().reports(20),
-            "issues": rt.persona_mem().top_issues(10),
+            "reports": rt.persona_mem().reports(200),
         }
         out_dir = RUNTIME_DIR / "memory"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -601,14 +627,115 @@ def create_app(rt: Runtime) -> FastAPI:
             raise HTTPException(status_code=400, detail="文件内容不是对象")
         if payload.get("format") not in (None, "qqchatbot-persona-reports"):
             raise HTTPException(status_code=400, detail="这不是自检报告文件")
-        rt.persona_mem().restore(
-            payload.get("reports") or [], payload.get("issues") or []
+        mode = str(body.get("mode") or "merge").lower()
+        replace = mode == "replace"
+        added = rt.persona_mem().restore(
+            payload.get("reports") or [], replace=replace
         )
-        rt.store.audit("persona.reports.import", actor="admin")
+        rt.store.audit(
+            "persona.reports.import",
+            actor="admin",
+            mode="replace" if replace else "merge",
+            added=added,
+        )
         return {
             "ok": True,
-            "reports": len(rt.persona_mem().reports(20)),
-            "issues": len(rt.persona_mem().top_issues(20)),
+            "mode": "replace" if replace else "merge",
+            "added": added,
+            "reports": len(rt.persona_mem().reports(200)),
+        }
+
+    @app.post("/api/persona/check")
+    async def run_persona_check(request: Request):
+        guard(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        result = await rt.persona_check_now(
+            str(body.get("group") or "").strip(),
+            str(body.get("member") or "").strip(),
+            str(body.get("mode") or "").strip(),
+        )
+        rt.store.audit(
+            "persona.check",
+            actor="admin",
+            status=result.get("status") or "error",
+            group=str(result.get("group") or "")[-8:],
+        )
+        return result
+
+    @app.post("/api/persona/reports/item")
+    async def update_persona_report(request: Request):
+        guard(request)
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="内容不是对象")
+        report_id = str(body.get("id") or "").strip()
+        if not report_id:
+            raise HTTPException(status_code=400, detail="缺少报告标识")
+        report = rt.persona_mem().update_report(
+            report_id,
+            str(body.get("note") or ""),
+        )
+        if report is None:
+            raise HTTPException(status_code=404, detail="没有找到这条自检报告")
+        rt.store.audit(
+            "persona.report.update",
+            actor="admin",
+            group=str(report.get("group") or "")[-8:],
+            weight=report.get("weight"),
+        )
+        return {
+            "ok": True,
+            "report": report,
+            "reports": rt.persona_mem().reports(200),
+        }
+
+    @app.post("/api/persona/reports/item/delete")
+    async def delete_persona_report(request: Request):
+        guard(request)
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="内容不是对象")
+        report_id = str(body.get("id") or "").strip()
+        if not report_id:
+            raise HTTPException(status_code=400, detail="缺少报告标识")
+        removed = rt.persona_mem().delete_report(report_id)
+        if not removed:
+            raise HTTPException(status_code=404, detail="没有找到这条自检报告")
+        rt.store.audit(
+            "persona.report.delete",
+            actor="admin",
+            report=report_id[:12],
+        )
+        return {
+            "ok": True,
+            "reports": rt.persona_mem().reports(200),
+        }
+
+    @app.post("/api/persona/reports/clear")
+    async def clear_persona_reports(request: Request):
+        guard(request)
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="内容不是对象")
+        group = str(body.get("group") or "").strip()
+        if not group:
+            raise HTTPException(status_code=400, detail="缺少群标识")
+        removed = rt.persona_mem().clear_group(group)
+        rt.store.audit(
+            "persona.report.clear",
+            actor="admin",
+            group=group[-8:],
+            removed=removed,
+        )
+        return {
+            "ok": True,
+            "removed": removed,
+            "reports": rt.persona_mem().reports(200),
         }
 
     @app.get("/api/reply/export")

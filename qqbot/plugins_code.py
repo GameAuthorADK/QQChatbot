@@ -31,7 +31,7 @@ from .paths import FROZEN, PLUGINS_DIR, RUNTIME_DIR
 
 log = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT = 3.0
+DEFAULT_TIMEOUT = 10.0
 MAX_FILE_BYTES = 512 * 1024
 MAX_STORE_BYTES = 100_000
 

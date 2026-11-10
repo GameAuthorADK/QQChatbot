@@ -30,7 +30,12 @@ from .gateway.token import TokenManager
 from .paths import instance_id
 from .providers import ChatMessage, build_provider, build_messages
 from .proactive_plugin import ProactiveMemory
-from .persona_plugin import PersonaMemory
+from .persona_plugin import (
+    MAX_NOTE_CHARS,
+    PersonaMemory,
+    _norm_weight,
+    parse_report_lines,
+)
 from .quota import Quota
 from .ratelimit import SlidingWindow
 from .repeat_plugin import RepeatMemory
@@ -63,6 +68,8 @@ SUMMARY_BATCH = 30
 SUMMARY_MAX_PENDING = 200
 #: 攒够这么多条就整理一次（短消息很难达到 token 阈值）
 SUMMARY_MIN_MESSAGES = 60
+#: 自检时最多看多少条最近的机器人回复
+PERSONA_RECENT_MAX = 10
 
 
 HOUSE_RULES = {
@@ -1531,6 +1538,7 @@ class Runtime:
         mem = getattr(self, "_persona_mem_instance", None)
         if mem is None:
             mem = PersonaMemory(self.store)
+            mem.rebalance()
             self._persona_mem_instance = mem
         return mem
 
@@ -1814,6 +1822,8 @@ class Runtime:
         try:
             await sender.send_group_text(group, text)
             self.reply_count += 1
+            self._remember_assistant(group, text)
+            self._bump_persona_turn(group, "chat")
             log.info("主动发言 group=%s len=%d", group[-4:], len(text))
             return True
         except Exception as exc:
@@ -1844,6 +1854,15 @@ class Runtime:
                 + base
                 + "\n只输出一句，不超过 40 字，不 @ 人，不解释，不用句号结尾。"
             )
+            if self.cfg.persona_guard_enabled:
+                reports = self.persona_mem().active_reports(group, "chat", 50)
+                if reports:
+                    lines = [
+                        f"- {str(item.get('note') or '')[:160]}"
+                        f"（{float(item.get('weight') or 0):.1f}）"
+                        for item in reports
+                    ]
+                    system += "\n\n【人设自检提醒】\n" + "\n".join(lines)[:900]
             context = self._listen_context(group).strip()
             user = context or "群里现在比较安静，主动开一个轻松的话题。"
             try:
@@ -1878,6 +1897,7 @@ class Runtime:
                 self.proactive_mem().bump(
                     group, time.strftime("%Y-%m-%d")
                 )
+                self._maybe_persona_check(group, "chat")
             return ok
         finally:
             busy.discard(group)
@@ -2108,28 +2128,95 @@ class Runtime:
             self._queue_summary(
                 msg.group_openid, member, dropped, mode
             )
+        if assistant_text:
+            self._remember_assistant(msg.group_openid, assistant_text)
 
-    def _persona_check_due(self, msg: GroupMessage, mode: str) -> bool:
-        if not self.cfg.persona_guard_enabled:
-            return False
-        interval = int(self.cfg.persona_check_interval or 0)
-        if interval <= 0:
-            return False
+    def _remember_assistant(self, group: str, text: str) -> None:
+        """记录机器人最近说过的话，主动发言也能纳入自检。"""
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not text:
+            return
+        bufs = getattr(self, "_persona_recent", None)
+        if bufs is None:
+            bufs = {}
+            self._persona_recent = bufs
+        buf = bufs.get(group)
+        if buf is None:
+            buf = deque(maxlen=PERSONA_RECENT_MAX)
+            bufs[group] = buf
+        buf.append(text[:300])
+
+    def _recent_assistant(self, group: str) -> list[str]:
+        bufs = getattr(self, "_persona_recent", None) or {}
+        buf = bufs.get(group)
+        return list(buf)[-PERSONA_RECENT_MAX:] if buf else []
+
+    def _bump_persona_turn(self, group: str, mode: str) -> None:
+        """累计机器人自己的聊天回复数；其他模式不计。"""
+        if (str(mode or "chat")[:24] or "chat") != "chat":
+            return
         counts = getattr(self, "_persona_turns", None)
         if counts is None:
             counts = {}
             self._persona_turns = counts
-        key = (msg.group_openid, msg.member_openid, mode)
+        key = (group, mode)
         counts[key] = counts.get(key, 0) + 1
-        return counts[key] % interval == 0
 
-    async def _persona_check(
-        self, msg: GroupMessage, mode: str, history: list[dict]
-    ) -> str:
-        """定期检查机器人最近的回复有没有偏离人设，返回一句纠正提醒。"""
+    def _persona_check_due(self, target, mode: str) -> bool:
+        """按群累计机器人自己的回复数，达到设定条数后更新一次报告。"""
+        if not self.cfg.persona_guard_enabled:
+            return False
+        if (str(mode or "chat")[:24] or "chat") != "chat":
+            return False
+        interval = int(self.cfg.persona_check_interval or 0)
+        if interval <= 0:
+            return False
+        group = (
+            target if isinstance(target, str) else target.group_openid
+        )
+        counts = getattr(self, "_persona_turns", None)
+        if counts is None:
+            counts = {}
+            self._persona_turns = counts
+        key = (group, mode)
+        if int(counts.get(key) or 0) < interval:
+            return False
+        counts[key] = 0
+        return True
+
+    async def _persona_check_report(
+        self,
+        group: str,
+        mode: str,
+        history: list[dict],
+        source: str = "auto",
+    ) -> dict:
+        """检查最近回复并始终记录一份文字报告；只记录聊天模式。"""
+        mode = "chat"
         provider = self.provider
         if provider is None:
-            return ""
+            return {
+                "status": "error",
+                "note": "当前没有可用的模型，无法执行自检",
+                "weight": 0.0,
+            }
+        recent: list[str] = []
+        for m in history[-10:]:
+            if m.get("role") != "assistant":
+                continue
+            text = str(m.get("content", "")).strip()
+            if text:
+                recent.append(text)
+        for text in self._recent_assistant(group):
+            if text and text not in recent:
+                recent.append(text)
+        recent = [s for s in recent if s.strip()][-PERSONA_RECENT_MAX:]
+        if not recent:
+            self.persona_mem().record(
+                group, mode, "ok", "", source=source, weight=0.0
+            )
+            return {"status": "ok", "note": "", "weight": 0.0}
+
         temp = None
         if self.cfg.persona_check_use_separate:
             provider_id = (
@@ -2159,43 +2246,56 @@ class Runtime:
                 temp = None
                 provider = self.provider
         try:
-            recent = [
-                m for m in history[-10:] if m.get("role") == "assistant"
-            ]
-            if not recent:
-                return ""
             anchor = (self.cfg.persona_anchor or "").strip()
             persona = (self.cfg.persona or "").strip()
+            negative = (self.cfg.negative_prompt or "").strip()
             base = anchor or persona[:800]
-            body = "\n".join(
-                str(m.get("content", ""))[:200] for m in recent
-            )[-1200:]
-            user = (
-                f"【人设锚点】\n{base}\n\n"
-                f"【最近的机器人回复】\n{body}"
-            )
-            issues = self.persona_mem().top_issues(5)
-            if issues:
-                user += "\n\n【重点检查这些问题】\n" + "\n".join(
-                    f"- 权重{int(i.get('weight') or 0)}："
-                    f"{str(i.get('text') or '')[:160]}"
-                    for i in issues
+            body = "\n".join(s[:200] for s in recent)[-1200:]
+            user = f"【人设锚点】\n{base}\n"
+            if negative:
+                user += f"\n【禁止事项】\n{negative[:600]}\n"
+            user += f"\n【最近的机器人回复】\n{body}"
+            check_prompt = prompts.PERSONA_CHECK_PROMPT[:4000]
+            reports = self.persona_mem().active_reports(group, mode, 50)
+            if reports:
+                user += "\n\n【最近的自检报告】\n" + "\n".join(
+                    f"- {str(i.get('note') or '')[:160]}"
+                    f"（{float(i.get('weight') or 0):.1f}）"
+                    for i in reports
                 )
-            timeout = max(5, min(20, int(self.cfg.timeout_s or 20)))
+            timeout = max(
+                10,
+                min(
+                    60 if source == "manual" else 30,
+                    int(self.cfg.timeout_s or 20),
+                ),
+            )
             try:
                 comp = await asyncio.wait_for(
                     provider.complete(
                         [
-                            ChatMessage("system", prompts.PERSONA_CHECK_PROMPT),
+                            ChatMessage(
+                                "system", check_prompt
+                            ),
                             ChatMessage("user", user),
                         ],
                         timeout=timeout,
-                        max_tokens=120,
+                        max_tokens=600,
                     ),
                     timeout=timeout + 1,
                 )
-            except Exception:
-                return ""
+            except Exception as exc:
+                note = f"自检调用失败：{str(exc)[:120]}"
+                self.persona_mem().record(
+                    group,
+                    mode,
+                    "error",
+                    note,
+                    source=source,
+                    weight=0.0,
+                )
+                log.warning("人设自检失败：%s", exc)
+                return {"status": "error", "note": note, "weight": 0.0}
             try:
                 self.quota.record_usage(
                     getattr(comp, "usage", {}), getattr(provider, "id", "")
@@ -2203,30 +2303,191 @@ class Runtime:
             except Exception:
                 pass
             text = (comp.text or "").strip()
-            if (
-                not text
-                or text.upper().startswith("OK")
-                or text.startswith("没有")
-            ):
-                self.persona_mem().record(
-                    msg.group_openid, msg.member_openid, mode, "ok"
-                )
-                return ""
-            note = text[:200]
+            status, note, weight = self._parse_persona_report(text)
+            if weight <= 0.0:
+                note = ""
             self.persona_mem().record(
-                msg.group_openid,
-                msg.member_openid,
+                group,
                 mode,
-                "drift",
+                status,
                 note,
+                source=source,
+                weight=weight,
             )
-            return note
+            return {"status": status, "note": note, "weight": weight}
         finally:
             if temp is not None:
                 try:
                     await temp.aclose()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _parse_persona_report(text: str) -> tuple[str, str, float]:
+        """解析多行「- 内容（权重）」，兼容旧的报告/权重格式。"""
+        raw = (text or "").strip()
+        if not raw:
+            return "ok", "", 0.0
+
+        report_match = re.search(
+            r"报告\s*[:：]\s*(.*?)(?:\n\s*权重\s*[:：]|\Z)", raw, re.S
+        )
+        weight_match = re.search(
+            r"权重\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)", raw
+        )
+        if report_match:
+            content = report_match.group(1).strip()
+            content = re.sub(
+                r"^\s*状态\s*[:：]\s*(正常|跑偏)\s*", "", content
+            ).strip()
+            content = re.sub(r"\s+", " ", content).strip()
+            weight = (
+                _norm_weight(weight_match.group(1), 0.0)
+                if weight_match
+                else 0.0
+            )
+            if not content:
+                return "ok", "", 0.0
+            if weight <= 0.0:
+                return "ok", "", 0.0
+            note = f"- {content}（{weight:.1f}）"
+            return "drift", note[:MAX_NOTE_CHARS], weight
+
+        parsed = parse_report_lines(raw)
+        if not parsed:
+            parsed = [(raw, 0.0, False)]
+        note_lines: list[str] = []
+        weight = 0.0
+        for content, line_weight, has_weight in parsed:
+            if has_weight and line_weight > 0.0:
+                note_lines.append(f"- {content}（{line_weight:.1f}）")
+                weight = max(weight, line_weight)
+            else:
+                note_lines.append(f"- {content}")
+        note = "\n".join(note_lines)[:MAX_NOTE_CHARS]
+        return ("drift" if weight > 0.0 else "ok"), note, weight
+
+    def _maybe_persona_check(
+        self,
+        group: str,
+        mode: str,
+        history: list[dict] | None = None,
+    ) -> None:
+        """自动自检放到后台，不阻塞当前回复。"""
+        if (str(mode or "chat")[:24] or "chat") != "chat":
+            return
+        busy = getattr(self, "_persona_check_busy", None)
+        if busy is None:
+            busy = set()
+            self._persona_check_busy = busy
+        key = (group, mode)
+        if key in busy:
+            return
+        if not self._persona_check_due(group, mode):
+            return
+        busy.add(key)
+        recent_history = list(history or [])
+
+        async def _run() -> None:
+            try:
+                await self._persona_check_report(
+                    group,
+                    mode,
+                    recent_history,
+                    source="auto",
+                )
+            except Exception:
+                log.debug("人设自检异常", exc_info=True)
+            finally:
+                busy.discard(key)
+
+        asyncio.create_task(_run(), name=f"persona-check-{mode}")
+
+    async def _persona_check(
+        self, msg: GroupMessage, mode: str, history: list[dict]
+    ) -> str:
+        """兼容旧调用：只返回需要注入的纠正提醒。"""
+        result = await self._persona_check_report(
+            msg.group_openid,
+            mode,
+            history,
+            source="auto",
+        )
+        if result.get("status") == "drift" and float(
+            result.get("weight") or 0
+        ) > 0:
+            return str(result.get("note") or "")
+        return ""
+
+    async def persona_check_now(
+        self, group: str = "", member: str = "", mode: str = ""
+    ) -> dict:
+        """手动自检：默认检查最近一段有记录的对话。"""
+        if self.provider is None:
+            return {
+                "ok": False,
+                "error": "当前没有可用的模型，请先在「基础设置 → 模型」里配置",
+            }
+        pick = {"group": group, "member": member, "mode": "chat"}
+        if not (pick["group"] and pick["member"]):
+            try:
+                rows = self.store.recent_threads(50)
+            except AttributeError:
+                rows = []
+            rows = [
+                r
+                for r in rows
+                if (r.get("mode") or "chat") == "chat"
+            ]
+            if pick["group"]:
+                rows = [r for r in rows if r.get("group") == pick["group"]]
+            if pick["member"]:
+                rows = [r for r in rows if r.get("member") == pick["member"]]
+            if rows:
+                pick = {
+                    "group": rows[0].get("group") or "",
+                    "member": rows[0].get("member") or "",
+                    "mode": "chat",
+                }
+            elif pick["group"]:
+                # 只有主动发言、还没写进对话线程的群。
+                if not self._recent_assistant(pick["group"]):
+                    return {
+                        "ok": False,
+                        "error": "这个群里还没有可检查的机器人回复",
+                    }
+                pick["mode"] = "chat"
+            else:
+                bufs = getattr(self, "_persona_recent", None) or {}
+                groups = [g for g, buf in bufs.items() if buf]
+                if groups:
+                    pick = {"group": groups[-1], "member": "", "mode": "chat"}
+                else:
+                    return {
+                        "ok": False,
+                        "error": "还没有可检查的对话，先让机器人回复几条消息",
+                    }
+        group = pick["group"]
+        member = pick["member"]
+        mode = "chat"
+        history = self.store.get_thread(group, member, mode)
+        result = await self._persona_check_report(
+            group, mode, history, source="manual"
+        )
+        return {
+            "ok": result.get("status") != "error",
+            "status": result.get("status"),
+            "note": result.get("note"),
+            "weight": result.get("weight"),
+            "group": group,
+            "mode": mode,
+            "reports": self.persona_mem().reports(200),
+            "error": (
+                result.get("note")
+                if result.get("status") == "error"
+                else None
+            ),
+        }
 
     async def _generate(
         self, msg: GroupMessage, spec=None, context: str = ""
@@ -2260,18 +2521,16 @@ class Runtime:
             ]
             system += "\n\n【该用户在其他群的记忆】\n" + "\n".join(lines)[:900]
         if self.cfg.persona_guard_enabled:
-            issues = self.persona_mem().top_issues(5)
-            if issues:
+            reports = self.persona_mem().active_reports(
+                msg.group_openid, mode, 50
+            )
+            if reports:
                 lines = [
-                    f"- 权重{int(item.get('weight') or 0)}："
-                    f"{str(item.get('text') or '')[:160]}"
-                    for item in issues
+                    f"- {str(item.get('note') or '')[:160]}"
+                    f"（{float(item.get('weight') or 0):.1f}）"
+                    for item in reports
                 ]
-                system += "\n\n【人设重点避免】\n" + "\n".join(lines)[:900]
-        if self._persona_check_due(msg, mode):
-            note = await self._persona_check(msg, mode, history)
-            if note:
-                system += f"\n\n【人设自检提醒】\n{note}"
+                system += "\n\n【人设自检提醒】\n" + "\n".join(lines)[:900]
         current_text = msg.content or "[非文本消息]"
         context = (context or "").strip()
         user_text = (
@@ -2340,6 +2599,10 @@ class Runtime:
         except Exception:
             pass
         self._remember_exchange(msg, mode, user_text, reply)
+        self._bump_persona_turn(msg.group_openid, mode)
+        self._maybe_persona_check(
+            msg.group_openid, mode, history
+        )
         return reply
 
     def _queue_summary(
@@ -3252,8 +3515,7 @@ class Runtime:
                 "style_prompt": self.cfg.style_prompt,
                 "persona_anchor": self.cfg.persona_anchor,
             },
-            "persona_reports": self.persona_mem().reports(20),
-            "persona_issues": self.persona_mem().top_issues(10),
+            "persona_report_total": self.persona_mem().count_reports(),
             "memory": {
                 "auto_summary": self.cfg.auto_summary,
                 "trigger_tokens": self.cfg.summary_trigger_tokens,
@@ -3268,7 +3530,7 @@ class Runtime:
                     - estimate_tokens(prompts.compose(self.cfg)),
                 ),
                 "pending": self.store.pending_summary(),
-                "items": self.store.list_summaries(),
+                "total": self.store.count_summaries(),
             },
             "reply": {
                 "fallback_reply": self.cfg.fallback_reply,

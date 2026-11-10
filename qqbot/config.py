@@ -92,6 +92,7 @@ class InstanceConfig:
     # 内置插件：人设稳定
     persona_guard_enabled: bool = False
     persona_anchor: str = ""
+    #: 按群累计多少条对话消息后自动更新一次自检报告
     persona_check_interval: int = 20
     #: 人设自检单独使用模型；启用后可以填不同的服务商 / 地址 / Key
     persona_check_use_separate: bool = False

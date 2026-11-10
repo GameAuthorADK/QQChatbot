@@ -75,7 +75,7 @@ if (-not $Fresh -and (Test-Path $dist)) {
 
 # 3) build
 Write-Host "== pyinstaller ==" -ForegroundColor Cyan
-& ".\.venv\Scripts\pyinstaller.exe" --noconfirm --clean --onedir --noconsole --name QQChatbot --hidden-import pystray --hidden-import pystray._win32 --hidden-import six --hidden-import six.moves --collect-submodules pystray entry.py
+& ".\.venv\Scripts\pyinstaller.exe" --noconfirm --clean --onedir --noconsole --name QQChatbot --icon "assets\icon.ico" --add-data "assets;assets" --hidden-import pystray --hidden-import pystray._win32 --hidden-import six --hidden-import six.moves --collect-submodules pystray entry.py
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed. User data is still at: $stash" -ForegroundColor Red
     exit 1
@@ -121,6 +121,13 @@ Copy-Item "THIRD_PARTY_NOTICES.md" $dist -Force -ErrorAction SilentlyContinue
 $docsDist = Join-Path $dist "docs"
 if (Test-Path $docsDist) { Remove-Item $docsDist -Recurse -Force }
 Copy-Item "docs" $docsDist -Recurse -Force
+
+# 5c) application and tray icon
+$assetsDist = Join-Path $dist "assets"
+if (Test-Path $assetsDist) { Remove-Item $assetsDist -Recurse -Force }
+if (Test-Path "assets") {
+    Copy-Item "assets" $assetsDist -Recurse -Force
+}
 
 # retired built-in example: /lucky is now the fortune minigame
 $legacyLucky = Join-Path $dist "plugins\lucky.py"

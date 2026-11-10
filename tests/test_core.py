@@ -860,9 +860,9 @@ class TestMemory(unittest.TestCase):
         self.assertEqual([d["content"] for d in dropped], ["u0", "a0"])
 
     def test_memory_state_roundtrip(self):
-        self.store.save_memory_state("g", "m", "- 用户叫小林", [{"role": "user", "content": "hi"}])
+        self.store.save_memory_state("g", "m", "- 用户叫小周", [{"role": "user", "content": "hi"}])
         summary, pending = self.store.get_memory_state("g", "m")
-        self.assertEqual(summary, "- 用户叫小林")
+        self.assertEqual(summary, "- 用户叫小周")
         self.assertEqual(len(pending), 1)
 
     def test_memory_isolated_per_member(self):
@@ -870,6 +870,55 @@ class TestMemory(unittest.TestCase):
         self.store.save_memory_state("g", "m2", "B", [])
         self.assertEqual(self.store.get_memory_state("g", "m1")[0], "A")
         self.assertEqual(self.store.get_memory_state("g", "m2")[0], "B")
+
+    def test_memory_updated_at_refreshes_on_save(self):
+        import time
+
+        self.store.save_memory_state("g", "m", "A", [])
+        first = self.store.list_summaries()[0]["updated_at"]
+        time.sleep(0.02)
+        self.store.save_memory_state("g", "m", "B", [])
+        second = self.store.list_summaries()[0]["updated_at"]
+        self.assertGreater(second, first)
+
+    def test_memory_total_limit(self):
+        import time
+
+        self.store.save_memory_state(
+            "g", "m0", "S0", [{"role": "user", "content": "old"}]
+        )
+        for i in range(1, 205):
+            self.store.save_memory_state("g", f"m{i}", f"S{i}", [])
+            time.sleep(0.001)
+        rows = self.store.list_summaries()
+        self.assertEqual(len(rows), 200)
+        self.assertEqual(self.store.get_summary("g", "m0"), "")
+        self.assertEqual(self.store.get_memory_state("g", "m0")[1], [])
+        self.assertEqual(self.store.get_summary("g", "m204"), "S204")
+
+    def test_memory_page(self):
+        for i in range(25):
+            self.store.save_memory_state("g", f"m{i}", f"S{i}", [])
+        items, total = self.store.list_summaries_page(page=2, size=10)
+        self.assertEqual(total, 25)
+        self.assertEqual(len(items), 10)
+
+    def test_memory_limit_after_restore_backup(self):
+        import time
+
+        src_path = Path(self.tmp.name) / "backup.db"
+        src = Store(src_path)
+        try:
+            for i in range(205):
+                src.save_memory_state("g", f"m{i}", f"S{i}", [])
+                time.sleep(0.001)
+        finally:
+            src.close()
+        self.store.restore_from(src_path)
+        rows = self.store.list_summaries()
+        self.assertEqual(len(rows), 200)
+        self.assertEqual(self.store.get_summary("g", "m0"), "")
+        self.assertEqual(self.store.get_summary("g", "m204"), "S204")
 
     def test_pending_summary(self):
         self.store.save_memory_state(
@@ -897,9 +946,13 @@ class TestSummaryPrompt(unittest.TestCase):
         from qqbot import prompts
 
         self.assertIn("记忆整理任务", prompts.SUMMARY_PROMPT)
+        self.assertIn("最多 10 条", prompts.SUMMARY_PROMPT)
         self.assertIn("最多 6 条", prompts.SUMMARY_PROMPT)
-        self.assertIn("最多 2 条概括", prompts.SUMMARY_PROMPT)
+        self.assertIn("最多 4 条", prompts.SUMMARY_PROMPT)
         self.assertIn("以新内容为准", prompts.SUMMARY_PROMPT)
+        self.assertIn("物品", prompts.SUMMARY_PROMPT)
+        self.assertIn("用户用「助手」称呼机器人", prompts.SUMMARY_PROMPT)
+        self.assertIn("不要按固定词表判断", prompts.SUMMARY_PROMPT)
 
     def test_no_manual_memory_section(self):
         from qqbot import prompts
@@ -3761,6 +3814,18 @@ class TestBatchFeatures(unittest.TestCase):
         text = prompts.compose(enabled.cfg)
         self.assertIn("【人设锚点】", text)
         self.assertIn("老油条", text)
+        self.assertIn("- 问题内容（权重）", prompts.PERSONA_CHECK_PROMPT)
+        self.assertNotIn("状态：", prompts.PERSONA_CHECK_PROMPT)
+        status, note, weight = enabled._parse_persona_report(
+            "报告：太像客服了，下一句短一点。\n权重：0.8"
+        )
+        self.assertEqual((status, weight), ("drift", 0.8))
+        self.assertIn("客服", note)
+        status, note, weight = enabled._parse_persona_report(
+            "报告：语气正常，继续保持。\n权重：0.0"
+        )
+        self.assertEqual((status, weight), ("ok", 0.0))
+        self.assertEqual(note, "")
 
         disabled = self._rt(persona_guard_enabled=False)
         self.assertNotIn("【人设锚点】", prompts.compose(disabled.cfg))
@@ -3772,7 +3837,7 @@ class TestBatchFeatures(unittest.TestCase):
                 system = messages[0].content or ""
                 if "人设检查器" in system:
                     return SimpleNamespace(
-                        text="别用客服腔，短一点。",
+                        text="别用客服腔，短一点。（0.5）",
                         usage={"total_tokens": 4},
                     )
                 return SimpleNamespace(text="行", usage={"total_tokens": 1})
@@ -3780,21 +3845,27 @@ class TestBatchFeatures(unittest.TestCase):
         msg = GroupMessage("g", "m", "member", "id", "在吗", "", 0, mentioned=True)
         enabled.provider = Provider()
         self.assertFalse(enabled._persona_check_due(msg, "chat"))
+        enabled._bump_persona_turn("g", "chat")
+        self.assertFalse(enabled._persona_check_due(msg, "chat"))
+        enabled._bump_persona_turn("g", "chat")
         self.assertTrue(enabled._persona_check_due(msg, "chat"))
         history = [{"role": "assistant", "content": "您好，请问有什么可以帮您？"}]
         note = asyncio.run(enabled._persona_check(msg, "chat", history))
         self.assertIn("客服腔", note)
         reports = enabled.persona_mem().reports()
         self.assertEqual(reports[0]["status"], "drift")
+        self.assertEqual(reports[0]["member"], "")
         self.assertIn("客服腔", reports[0]["note"])
-        issues = enabled.persona_mem().top_issues()
-        self.assertEqual(issues[0]["weight"], 1)
+        active = enabled.persona_mem().active_reports("g", "chat")
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["weight"], 0.5)
+
         enabled.persona_mem().record(
-            "g", "m", "chat", "drift", "别用客服腔，短一点。"
+            "g", "chat", "drift", "别用客服腔，短一点。", weight=0.5
         )
-        issues = enabled.persona_mem().top_issues()
-        self.assertEqual(issues[0]["weight"], 2)
-        self.assertEqual(issues[0]["count"], 2)
+        self.assertEqual(
+            len(enabled.persona_mem().active_reports("g", "chat")), 1
+        )
 
         seen = []
 
@@ -3808,7 +3879,7 @@ class TestBatchFeatures(unittest.TestCase):
         enabled.provider = PromptProvider()
         enabled.cfg.persona_check_interval = 0
         asyncio.run(enabled._generate(msg))
-        self.assertIn("【人设重点避免】", seen[0][0].content)
+        self.assertIn("【人设自检提醒】", seen[0][0].content)
         self.assertIn("客服腔", seen[0][0].content)
 
         class OkProvider:
@@ -3820,7 +3891,21 @@ class TestBatchFeatures(unittest.TestCase):
         ok_rt = self._rt(persona_guard_enabled=True)
         ok_rt.provider = OkProvider()
         self.assertEqual(asyncio.run(ok_rt._persona_check(msg, "chat", history)), "")
-        self.assertEqual(ok_rt.persona_mem().reports()[0]["status"], "ok")
+        ok_report = ok_rt.persona_mem().reports()[0]
+        self.assertEqual(ok_report["status"], "ok")
+        self.assertEqual(ok_report["note"], "")
+        self.assertEqual(ok_report["weight"], 0.0)
+        self.assertEqual(ok_rt.persona_mem().active_reports("g", "chat"), [])
+        seen.clear()
+        ok_rt.provider = PromptProvider()
+        asyncio.run(ok_rt._generate(msg))
+        self.assertNotIn("客服腔", seen[0][0].content)
+        self.assertNotIn("【人设自检提醒】", seen[0][0].content)
+        ok_rt.persona_mem().record(
+            "g0", "chat", "drift", "零权重报告", weight=0.0
+        )
+        self.assertEqual(ok_rt.persona_mem().active_reports("g0", "chat"), [])
+        self.assertEqual(ok_rt.persona_mem().reports()[0]["note"], "")
 
         from unittest import mock as umock
 
@@ -3834,7 +3919,7 @@ class TestBatchFeatures(unittest.TestCase):
             async def complete(self, messages, **kw):
                 self.used += 1
                 return SimpleNamespace(
-                    text="用短句，别客服腔", usage={"total_tokens": 3}
+                    text="用短句，别客服腔（0.5）", usage={"total_tokens": 3}
                 )
 
             async def aclose(self):
@@ -3866,18 +3951,423 @@ class TestBatchFeatures(unittest.TestCase):
         self.assertEqual(temp.used, 1)
         self.assertTrue(temp.closed)
 
-    def test_persona_reports_and_issues_are_capped(self):
+    def test_persona_check_counts_per_group_and_manual_runs(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot.events import GroupMessage
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                system = messages[0].content or ""
+                if "人设检查器" in system:
+                    return SimpleNamespace(
+                        text=(
+                            "报告：语气和人设一致，继续用短句。\n权重：0.0"
+                        ),
+                        usage={"total_tokens": 5},
+                    )
+                return SimpleNamespace(text="行", usage={"total_tokens": 1})
+
+        rt = self._rt(
+            persona_guard_enabled=True,
+            persona_anchor="说话短，不客服腔。",
+            persona_check_interval=2,
+        )
+        rt.provider = Provider()
+        a = GroupMessage("g", "m1", "member", "id1", "在吗", "", 0)
+        b = GroupMessage("g", "m2", "member", "id2", "在吗", "", 0)
+        self.assertFalse(rt._persona_check_due(a, "chat"))
+        rt._bump_persona_turn("g", "chat")
+        self.assertFalse(rt._persona_check_due(b, "chat"))
+        # 第二个成员的消息也算同一群的对话量，不再按成员单独计数。
+        rt._bump_persona_turn("g", "chat")
+        self.assertTrue(rt._persona_check_due(b, "chat"))
+
+        rt.cfg.persona_check_interval = 1
+        rt._bump_persona_turn("g", "chat")
+        rt._remember_assistant("g", "您好，请问有什么可以帮您？")
+        rt.store.append_turn("g", "m1", "在吗", "您好，请问有什么可以帮您？")
+
+        async def run_bg_and_manual():
+            rt._maybe_persona_check("g", "chat")
+            await asyncio.sleep(0.05)
+            return await rt.persona_check_now()
+
+        manual = asyncio.run(run_bg_and_manual())
+        self.assertTrue(manual["ok"])
+        self.assertEqual(manual["status"], "ok")
+        self.assertEqual(manual["note"], "")
+        reports = rt.persona_mem().reports()
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["source"], "manual")
+        self.assertEqual(reports[0]["member"], "")
+        self.assertEqual(rt.persona_mem().active_reports("g", "chat"), [])
+
+    def test_persona_manual_check_uses_proactive_buffer(self):
+        import asyncio
+        from collections import deque
+        from types import SimpleNamespace
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                return SimpleNamespace(
+                    text="报告：主动发言也保持了人设。\n权重：0.0",
+                    usage={},
+                )
+
+        rt = self._rt(persona_guard_enabled=True)
+        rt.provider = Provider()
+        rt._persona_recent = {"g-proactive": deque(["今晚聊点什么"])}
+        result = asyncio.run(rt.persona_check_now())
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["group"], "g-proactive")
+        self.assertEqual(result["note"], "")
+        report = rt.persona_mem().reports()[0]
+        self.assertEqual(report["source"], "manual")
+        self.assertEqual(report["member"], "")
+
+    def test_persona_check_records_error_report(self):
+        import asyncio
+        from qqbot.events import GroupMessage
+
+        class Broken:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                raise RuntimeError("模型不可用")
+
+        rt = self._rt(persona_guard_enabled=True)
+        rt.provider = Broken()
+        rt.store.append_turn("g", "m", "在吗", "您好，请问有什么可以帮您？")
+        msg = GroupMessage("g", "m", "member", "id", "在吗", "", 0)
+        note = asyncio.run(
+            rt._persona_check(
+                msg,
+                "chat",
+                [{"role": "assistant", "content": "您好，请问有什么可以帮您？"}],
+            )
+        )
+        self.assertEqual(note, "")
+        report = rt.persona_mem().reports()[0]
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["member"], "")
+        self.assertIn("自检调用失败", report["note"])
+        self.assertEqual(rt.persona_mem().active_reports("g", "chat"), [])
+
+    def test_persona_check_always_uses_builtin_prompt(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot import prompts
+        from qqbot.config import InstanceConfig
+
+        seen = []
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                seen.append(messages)
+                return SimpleNamespace(
+                    text="报告：检查通过。\n权重：0.0", usage={}
+                )
+
+        rt = self._rt(persona_guard_enabled=True)
+        rt.provider = Provider()
+        asyncio.run(
+            rt._persona_check_report(
+                "g",
+                "chat",
+                [
+                    {"role": "user", "content": "用户说了一句不该检查的话"},
+                    {"role": "assistant", "content": "机器人自己的回复"},
+                ],
+            )
+        )
+        self.assertEqual(seen[0][0].content, prompts.PERSONA_CHECK_PROMPT)
+        self.assertIn("只检查机器人自己", seen[0][0].content)
+        self.assertIn("机器人自己的回复", seen[0][1].content)
+        self.assertNotIn("用户说了一句不该检查的话", seen[0][1].content)
+        self.assertNotIn(
+            "persona_check_prompt", InstanceConfig.__dataclass_fields__
+        )
+
+    def test_persona_report_manual_edit(self):
         rt = self._rt()
-        for i in range(40):
-            rt.persona_mem().record("g", "m", "chat", "drift", f"问题{i}")
-        self.assertLessEqual(len(rt.persona_mem().reports(100)), 10)
-        self.assertLessEqual(len(rt.persona_mem().top_issues(100)), 10)
-        for _ in range(30):
-            rt.persona_mem().record("g", "m", "chat", "drift", "重复问题")
-        issues = rt.persona_mem().top_issues(100)
-        repeat = [i for i in issues if i["text"] == "重复问题"][0]
-        self.assertEqual(repeat["weight"], 20)
-        self.assertEqual(repeat["count"], 30)
+        first = rt.persona_mem().record(
+            "g", "chat", "drift", "旧问题", weight=0.5
+        )
+        updated = rt.persona_mem().update_report(
+            first["id"], "手动改过的报告（0.9）"
+        )
+        self.assertIsNotNone(updated)
+        self.assertIn("手动改过的报告", updated["note"])
+        self.assertEqual(updated["weight"], 0.9)
+        self.assertEqual(updated["status"], "drift")
+        active = rt.persona_mem().active_reports("g", "chat")
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["note"], "手动改过的报告")
+        self.assertEqual(active[0]["weight"], 0.9)
+
+        text_only = rt.persona_mem().update_report(
+            first["id"], "只改文字不改权重"
+        )
+        self.assertEqual(text_only["note"], "只改文字不改权重")
+        self.assertEqual(text_only["weight"], 0.0)
+        self.assertEqual(text_only["status"], "ok")
+        self.assertEqual(rt.persona_mem().active_reports("g", "chat"), [])
+
+        cleared = rt.persona_mem().update_report(first["id"], "")
+        self.assertEqual(cleared["note"], "")
+        self.assertEqual(cleared["weight"], 0.0)
+        self.assertEqual(cleared["status"], "ok")
+        self.assertEqual(rt.persona_mem().active_reports("g", "chat"), [])
+        self.assertIsNone(
+            rt.persona_mem().update_report("missing", "z")
+        )
+
+    def test_persona_report_multi_line_and_invalid_weight(self):
+        rt = self._rt()
+        status, note, weight = rt._parse_persona_report(
+            "- 问题一（0.7）\n- 问题二（0.4）"
+        )
+        self.assertEqual(status, "drift")
+        self.assertEqual(weight, 0.7)
+        self.assertIn("问题一", note)
+        self.assertIn("问题二", note)
+        report = rt.persona_mem().record("g", "chat", status, note, weight=weight)
+        active = rt.persona_mem().active_reports("g", "chat")
+        self.assertEqual(
+            [(r["note"], r["weight"]) for r in active],
+            [("问题一", 0.7), ("问题二", 0.4)],
+        )
+
+        rt.persona_mem().update_report(
+            report["id"], "- 问题三（abc）\n- 问题四（0.8）"
+        )
+        active = rt.persona_mem().active_reports("g", "chat")
+        self.assertEqual(
+            [(r["note"], r["weight"]) for r in active],
+            [("问题四", 0.8)],
+        )
+        self.assertIn("abc", rt.persona_mem().reports(200)[0]["note"])
+        rt.persona_mem().update_report(report["id"], "- 没有括号的问题")
+        self.assertEqual(rt.persona_mem().active_reports("g", "chat"), [])
+
+    def test_persona_max_problem_lines_per_group(self):
+        rt = self._rt()
+        note = "\n".join(f"- 问题{i}（0.5）" for i in range(12))
+        rt.persona_mem().record("g", "chat", "drift", note, weight=0.5)
+        active = rt.persona_mem().active_reports("g", "chat")
+        self.assertEqual(len(active), 10)
+        stored = rt.persona_mem().reports(200)[0]["note"]
+        self.assertEqual(len([x for x in stored.splitlines() if x.strip()]), 10)
+
+    def test_persona_reports_page(self):
+        rt = self._rt()
+        for i in range(25):
+            rt.persona_mem().record(
+                f"g{i}", "chat", "drift", f"问题{i}", weight=0.5
+            )
+        items, total = rt.persona_mem().reports_page(page=2, size=10)
+        self.assertEqual(total, 25)
+        self.assertEqual(len(items), 10)
+        self.assertEqual(items[0]["group"], "g14")
+
+    def test_persona_reports_are_group_level_and_capped(self):
+        rt = self._rt()
+        for i in range(80):
+            rt.persona_mem().record(
+                "g1", "chat", "drift", f"问题{i}", weight=0.4
+            )
+        self.assertLessEqual(len(rt.persona_mem().reports(200)), 10)
+
+        rt.persona_mem().set_report_limit(5)
+        self.assertLessEqual(len(rt.persona_mem().reports(200)), 5)
+
+        rt.persona_mem().record("gA", "chat", "drift", "聊天问题", weight=0.7)
+        rt.persona_mem().record(
+            "gA", "translate", "drift", "翻译问题", weight=0.9
+        )
+        chat = rt.persona_mem().active_reports("gA", "chat")
+        self.assertEqual(
+            [r["note"] for r in chat], ["翻译问题", "聊天问题"]
+        )
+        all_modes = rt.persona_mem().active_reports("gA", "")
+        self.assertEqual(
+            [r["note"] for r in all_modes], ["翻译问题", "聊天问题"]
+        )
+
+    def test_persona_report_limit_deletes_low_weight_first(self):
+        rt = self._rt()
+        rt.persona_mem().record("g", "chat", "drift", "低权重", weight=0.1)
+        rt.persona_mem().record("g", "chat", "drift", "高权重", weight=0.9)
+        rt.persona_mem().record("g", "chat", "drift", "中权重", weight=0.5)
+        rt.persona_mem().record("g", "chat", "drift", "次高权重", weight=0.7)
+        rt.persona_mem().set_report_limit(3)
+        notes = [
+            r["note"].replace("- ", "").split("（")[0]
+            for r in rt.persona_mem().reports(200)
+        ]
+        self.assertEqual(notes, ["次高权重", "中权重", "高权重"])
+        self.assertNotIn("低权重", notes)
+
+    def test_persona_report_keeps_newest_even_if_low_weight(self):
+        rt = self._rt()
+        rt.persona_mem().set_report_limit(3)
+        rt.persona_mem().record("g", "chat", "drift", "高1", weight=0.9)
+        rt.persona_mem().record("g", "chat", "drift", "高2", weight=0.8)
+        rt.persona_mem().record("g", "chat", "drift", "高3", weight=0.7)
+        latest = rt.persona_mem().record(
+            "g", "chat", "drift", "最新低权重", weight=0.1
+        )
+        reports = rt.persona_mem().reports(200)
+        notes = [r["note"] for r in reports]
+        self.assertTrue(any("最新低权重" in note for note in notes))
+        self.assertEqual(reports[0]["id"], latest["id"])
+        self.assertEqual(len(reports), 3)
+        self.assertFalse(any("高3" in note for note in notes))
+
+    def test_persona_edit_old_report_makes_it_current(self):
+        rt = self._rt()
+        first = rt.persona_mem().record(
+            "g", "chat", "drift", "旧报告", weight=0.2
+        )
+        rt.persona_mem().record("g", "chat", "drift", "新报告", weight=0.5)
+        active = rt.persona_mem().active_reports("g", "chat")
+        self.assertEqual(
+            [r["note"] for r in active], ["新报告", "旧报告"]
+        )
+
+        updated = rt.persona_mem().update_report(
+            first["id"], "旧报告已更新（0.9）"
+        )
+        self.assertIsNotNone(updated)
+        active = rt.persona_mem().active_reports("g", "chat")
+        self.assertEqual(
+            [r["note"] for r in active], ["旧报告已更新", "新报告"]
+        )
+        self.assertEqual(active[0]["id"], first["id"])
+        self.assertEqual(rt.persona_mem().reports(200)[0]["id"], first["id"])
+
+    def test_persona_import_dedupes_old_reports_without_id(self):
+        rt = self._rt()
+        report = {
+            "group": "g",
+            "mode": "chat",
+            "status": "drift",
+            "note": "重复报告",
+            "weight": 0.5,
+            "ts": 1.0,
+        }
+        rt.persona_mem().restore([report, dict(report)])
+        rows = rt.persona_mem().reports(200)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("重复报告", rows[0]["note"])
+
+    def test_persona_reports_keep_history_per_group(self):
+        rt = self._rt()
+        first = rt.persona_mem().record(
+            "g", "chat", "drift", "旧问题", weight=0.5
+        )
+        second = rt.persona_mem().record(
+            "g", "chat", "drift", "新问题", weight=0.7
+        )
+        reports = [
+            r for r in rt.persona_mem().reports(200) if r["group"] == "g"
+        ]
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(reports[0]["id"], second["id"])
+        self.assertEqual(reports[1]["id"], first["id"])
+        active = rt.persona_mem().active_reports("g", "chat")
+        self.assertEqual(
+            [r["note"] for r in active], ["新问题", "旧问题"]
+        )
+
+        self.assertTrue(rt.persona_mem().delete_report(second["id"]))
+        active = rt.persona_mem().active_reports("g", "chat")
+        self.assertEqual([r["note"] for r in active], ["旧问题"])
+        self.assertFalse(rt.persona_mem().delete_report(second["id"]))
+        third = rt.persona_mem().record(
+            "g", "chat", "drift", "删除后新报告", weight=0.6
+        )
+        active = rt.persona_mem().active_reports("g", "chat")
+        self.assertEqual(
+            [r["note"] for r in active], ["删除后新报告", "旧问题"]
+        )
+        self.assertEqual(active[0]["id"], third["id"])
+
+    def test_persona_zero_weight_does_not_use_limit(self):
+        rt = self._rt()
+        rt.persona_mem().set_report_limit(2)
+        rt.persona_mem().record("g", "chat", "drift", "高权重A", weight=0.9)
+        rt.persona_mem().record("g", "chat", "drift", "高权重B", weight=0.8)
+        rt.persona_mem().record("g", "chat", "ok", "", weight=0.0)
+        reports = rt.persona_mem().reports(200)
+        self.assertEqual(len(reports), 3)
+        self.assertEqual(reports[0]["weight"], 0.0)
+        active = rt.persona_mem().active_reports("g", "chat")
+        self.assertEqual(
+            [r["note"] for r in active], ["高权重A", "高权重B"]
+        )
+
+    def test_persona_total_report_limit_is_200(self):
+        rt = self._rt()
+        for i in range(25):
+            for j in range(10):
+                rt.persona_mem().record(
+                    f"g{i}",
+                    "chat",
+                    "drift",
+                    f"问题{i}-{j}",
+                    weight=0.5,
+                )
+        self.assertEqual(len(rt.persona_mem().reports(300)), 200)
+
+    def test_persona_import_merge_and_replace(self):
+        rt = self._rt()
+        rt.persona_mem().record("g1", "chat", "drift", "原报告", weight=0.5)
+        added = rt.persona_mem().restore(
+            [
+                {
+                    "group": "g2",
+                    "mode": "chat",
+                    "note": "追加报告",
+                    "weight": 0.6,
+                    "ts": 10.0,
+                }
+            ],
+            replace=False,
+        )
+        self.assertEqual(added, 1)
+        groups = {r["group"] for r in rt.persona_mem().reports(200)}
+        self.assertEqual(groups, {"g1", "g2"})
+        rt.persona_mem().restore(
+            [
+                {
+                    "group": "g3",
+                    "mode": "chat",
+                    "note": "覆盖报告",
+                    "weight": 0.7,
+                    "ts": 11.0,
+                }
+            ],
+            replace=True,
+        )
+        groups = {r["group"] for r in rt.persona_mem().reports(200)}
+        self.assertEqual(groups, {"g3"})
+
+    def test_persona_clear_group(self):
+        rt = self._rt()
+        rt.persona_mem().record("g1", "chat", "drift", "A", weight=0.5)
+        rt.persona_mem().record("g1", "chat", "drift", "B", weight=0.6)
+        rt.persona_mem().record("g2", "chat", "drift", "C", weight=0.7)
+        self.assertEqual(rt.persona_mem().clear_group("g1"), 2)
+        groups = {r["group"] for r in rt.persona_mem().reports(200)}
+        self.assertEqual(groups, {"g2"})
 
     def test_listen_min_members(self):
         from qqbot.events import GroupMessage

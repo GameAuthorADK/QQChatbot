@@ -14,6 +14,8 @@ from pathlib import Path
 from . import errors
 from .paths import DB_PATH
 
+MAX_MEMORIES = 200
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -372,7 +374,8 @@ class Store:
                 "(group_openid,member_openid,mode,messages,summary,pending,updated_at) "
                 "VALUES(?,?,?, '[]', ?, ?, ?) "
                 "ON CONFLICT(group_openid,member_openid,mode) DO UPDATE SET "
-                "summary=excluded.summary, pending=excluded.pending",
+                "summary=excluded.summary, pending=excluded.pending, "
+                "updated_at=excluded.updated_at",
                 (
                     group_openid,
                     member_openid,
@@ -382,13 +385,31 @@ class Store:
                     time.time(),
                 ),
             )
+            self._trim_summaries()
             self.conn.commit()
+
+    def _trim_summaries(self) -> None:
+        """总记忆数超过上限时，清掉最久没有更新的摘要。"""
+        rows = self.conn.execute(
+            "SELECT group_openid, member_openid, mode FROM threads "
+            "WHERE summary != '' ORDER BY updated_at ASC"
+        ).fetchall()
+        excess = len(rows) - MAX_MEMORIES
+        if excess <= 0:
+            return
+        for group, member, mode in rows[:excess]:
+            self.conn.execute(
+                "UPDATE threads SET summary='', pending='[]' "
+                "WHERE group_openid=? AND member_openid=? AND mode=?",
+                (group, member, mode),
+            )
 
     def list_summaries(self) -> list[dict]:
         with self._lock:
             rows = self.conn.execute(
                 "SELECT group_openid, member_openid, mode, summary, updated_at "
-                "FROM threads WHERE summary != '' ORDER BY updated_at DESC LIMIT 200"
+                "FROM threads WHERE summary != '' ORDER BY updated_at DESC LIMIT ?",
+                (MAX_MEMORIES,),
             ).fetchall()
         return [
             {
@@ -400,6 +421,41 @@ class Store:
             }
             for r in rows
         ]
+
+    def count_summaries(self) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM threads WHERE summary != ''"
+            ).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def list_summaries_page(
+        self, page: int = 1, size: int = 10
+    ) -> tuple[list[dict], int]:
+        size = max(1, min(50, int(size)))
+        page = max(1, int(page))
+        total = self.count_summaries()
+        pages = max(1, (total + size - 1) // size)
+        page = min(page, pages)
+        offset = (page - 1) * size
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT group_openid, member_openid, mode, summary, updated_at "
+                "FROM threads WHERE summary != '' "
+                "ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (size, offset),
+            ).fetchall()
+        items = [
+            {
+                "group": r[0],
+                "member": r[1],
+                "mode": r[2] or "chat",
+                "summary": r[3],
+                "updated_at": r[4],
+            }
+            for r in rows
+        ]
+        return items, total
 
     def pending_summary(self) -> dict:
         """待整理的记忆：去重人数、对话数和消息条数。"""
@@ -426,6 +482,25 @@ class Store:
             "threads": threads,
             "messages": messages,
         }
+
+    def recent_threads(self, limit: int = 50) -> list[dict]:
+        """按更新时间倒序返回有聊天记录的对话，供手动自检挑选。"""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT group_openid, member_openid, mode, updated_at "
+                "FROM threads WHERE messages NOT IN ('', '[]') "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (max(1, min(200, int(limit))),),
+            ).fetchall()
+        return [
+            {
+                "group": group,
+                "member": member,
+                "mode": mode or "chat",
+                "updated_at": float(updated_at or 0),
+            }
+            for group, member, mode, updated_at in rows
+        ]
 
     def pending_threads(self) -> list[dict]:
         """返回仍有待整理消息的对话，旧的排前面。"""
@@ -1405,6 +1480,9 @@ class Store:
             self.conn.executescript(SCHEMA)
             self.conn.commit()
         self._migrate()
+        with self._lock:
+            self._trim_summaries()
+            self.conn.commit()
 
     def reset_all(self) -> None:
         tables = [
