@@ -14,7 +14,7 @@ from collections import deque
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 
-from . import cards, checks, config, errors, prompts, secrets, wiki
+from . import cards, checks, config, errors, limits, prompts, secrets, wiki
 from . import builtins as builtin_plugins
 from . import images as image_utils
 from . import games as game_plugins
@@ -70,6 +70,13 @@ SUMMARY_MAX_PENDING = 200
 SUMMARY_MIN_MESSAGES = 60
 #: 自检时最多看多少条最近的机器人回复
 PERSONA_RECENT_MAX = 10
+#: 自检模型给出的严重程度换算成报告权重，避免它自己随手打分
+PERSONA_CHECK_WEIGHTS = {"严重": 0.9, "一般": 0.6, "轻微": 0.3}
+#: 「- 违反第 N 条：问题｜严重程度」
+PERSONA_VIOLATION_RE = re.compile(
+    r"^[-*•]\s*违反第\s*(\d+)\s*条\s*[:：]\s*(.+?)"
+    r"(?:\s*[｜|]\s*(严重|一般|轻微))?\s*$"
+)
 
 
 HOUSE_RULES = {
@@ -2215,11 +2222,17 @@ class Runtime:
             anchor = (self.cfg.persona_anchor or "").strip()
             persona = (self.cfg.persona or "").strip()
             negative = (self.cfg.negative_prompt or "").strip()
-            base = anchor or persona[:800]
+            base = anchor or persona[: limits.PERSONA]
             body = "\n".join(s[:200] for s in recent)[-1200:]
             user = f"【人设锚点】\n{base}\n"
+            checklist = [
+                f"{i}. {item}"
+                for i, item in enumerate(prompts.PERSONA_CHECK_ITEMS, 1)
+            ]
+            user += "\n【检查清单】\n" + "\n".join(checklist) + "\n"
             if negative:
-                user += f"\n【禁止事项】\n{negative[:600]}\n"
+                # 禁止事项就是检查规则本身，必须完整送入，不能截断
+                user += f"\n【禁止事项】\n{negative}\n"
             user += f"\n【最近的机器人回复】\n{body}"
             check_prompt = prompts.PERSONA_CHECK_PROMPT[:4000]
             reports = self.persona_mem().active_reports(group, mode, 50)
@@ -2246,7 +2259,7 @@ class Runtime:
                             ChatMessage("user", user),
                         ],
                         timeout=timeout,
-                        max_tokens=600,
+                        max_tokens=800,
                     ),
                     timeout=timeout + 1,
                 )
@@ -2269,7 +2282,10 @@ class Runtime:
             except Exception:
                 pass
             text = (comp.text or "").strip()
-            status, note, weight = self._parse_persona_report(text)
+            parsed = self._parse_checklist_report(text)
+            if parsed is None:
+                parsed = self._parse_persona_report(text)
+            status, note, weight = parsed
             if weight <= 0.0:
                 note = ""
             self.persona_mem().record(
@@ -2287,6 +2303,32 @@ class Runtime:
                     await temp.aclose()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _parse_checklist_report(text: str) -> tuple[str, str, float] | None:
+        """解析「- 违反第 N 条：问题｜严重程度」，权重由代码换算。"""
+        note_lines: list[str] = []
+        weight = 0.0
+        seen: set[int] = set()
+        for raw in str(text or "").splitlines():
+            match = PERSONA_VIOLATION_RE.match(raw.strip())
+            if not match:
+                continue
+            index = int(match.group(1))
+            if index in seen:
+                continue
+            content = re.sub(r"\s+", " ", match.group(2)).strip()
+            content = content.rstrip("。；; ")
+            if not content:
+                continue
+            seen.add(index)
+            level = match.group(3) or "一般"
+            line_weight = PERSONA_CHECK_WEIGHTS.get(level, 0.6)
+            note_lines.append(f"- {content}（{line_weight:.1f}）")
+            weight = max(weight, line_weight)
+        if not note_lines:
+            return None
+        return "drift", "\n".join(note_lines)[:MAX_NOTE_CHARS], weight
 
     @staticmethod
     def _parse_persona_report(text: str) -> tuple[str, str, float]:
@@ -2493,8 +2535,8 @@ class Runtime:
         if spec is not None and spec.extra_prompt:
             system += f"\n\n【当前模式：{spec.label}】\n{spec.extra_prompt}"
         if summary:
-            # 只注入当前说话人的记忆，并硬性截断，避免单条记忆撑爆上下文
-            system += f"\n\n【历史对话摘要】\n{summary[:800]}"
+            # 只注入当前说话人的记忆，完整注入，不做字数截断
+            system += f"\n\n【历史对话摘要】\n{summary}"
         try:
             cross = self.store.member_summaries(
                 member, mode, exclude_group=msg.group_openid, limit=3
@@ -2504,10 +2546,10 @@ class Runtime:
         if cross:
             lines = [
                 f"- 群{str(item.get('group') or '')[-4:]}："
-                f"{str(item.get('summary') or '')[:300]}"
+                f"{str(item.get('summary') or '')}"
                 for item in cross
             ]
-            system += "\n\n【该用户在其他群的记忆】\n" + "\n".join(lines)[:900]
+            system += "\n\n【该用户在其他群的记忆】\n" + "\n".join(lines)
         if self.cfg.persona_guard_enabled:
             reports = self.persona_mem().active_reports(
                 msg.group_openid, mode, 50
@@ -3132,15 +3174,25 @@ class Runtime:
     async def apply_persona(self, data: dict) -> dict:
         """人设只能改名字/人设/禁止事项，安全底线不可改。"""
         if "bot_name" in data:
-            self.cfg.bot_name = str(data.get("bot_name") or "").strip()[:40]
+            self.cfg.bot_name = str(data.get("bot_name") or "").strip()[
+                : limits.BOT_NAME
+            ]
         if "persona" in data:
-            self.cfg.persona = str(data.get("persona") or "").strip()[:2000]
+            self.cfg.persona = str(data.get("persona") or "").strip()[
+                : limits.PERSONA
+            ]
         if "negative_prompt" in data:
-            self.cfg.negative_prompt = str(data.get("negative_prompt") or "").strip()[:1000]
+            self.cfg.negative_prompt = str(
+                data.get("negative_prompt") or ""
+            ).strip()[: limits.NEGATIVE_PROMPT]
         if "style_prompt" in data:
-            self.cfg.style_prompt = str(data.get("style_prompt") or "").strip()[:800]
+            self.cfg.style_prompt = str(data.get("style_prompt") or "").strip()[
+                : limits.STYLE_PROMPT
+            ]
         if "persona_anchor" in data:
-            self.cfg.persona_anchor = str(data.get("persona_anchor") or "").strip()[:1000]
+            self.cfg.persona_anchor = str(
+                data.get("persona_anchor") or ""
+            ).strip()[: limits.PERSONA_ANCHOR]
         config.save(self.cfg)
         self.store.audit("config.persona", actor="admin",
                          name=self.cfg.bot_name, persona_len=len(self.cfg.persona))
@@ -3371,7 +3423,9 @@ class Runtime:
                 self.cfg.persona_guard_enabled = value
                 changed["persona_guard_enabled"] = value
         if "persona_anchor" in data:
-            text = str(data.get("persona_anchor") or "").strip()[:1000]
+            text = str(data.get("persona_anchor") or "").strip()[
+                : limits.PERSONA_ANCHOR
+            ]
             if text != self.cfg.persona_anchor:
                 self.cfg.persona_anchor = text
                 changed["persona_anchor"] = len(text)

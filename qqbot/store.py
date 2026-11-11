@@ -380,7 +380,7 @@ class Store:
                     group_openid,
                     member_openid,
                     mode,
-                    (summary or "")[:1500],
+                    summary or "",
                     json.dumps(pending[-200:], ensure_ascii=False),
                     time.time(),
                 ),

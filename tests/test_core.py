@@ -3537,6 +3537,38 @@ class TestBatchFeatures(unittest.TestCase):
         self.assertIn("【该用户在其他群的记忆】", system)
         self.assertIn("群1记忆", system)
 
+    def test_memory_injection_is_not_truncated(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot.events import GroupMessage
+
+        seen = []
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                seen.append(messages)
+                return SimpleNamespace(text="好", usage={})
+
+        rt = self._rt()
+        rt.provider = Provider()
+        current = "当前群记忆开头" + "甲" * 1800 + "当前群记忆结尾"
+        cross = "其他群记忆开头" + "乙" * 1800 + "其他群记忆结尾"
+        rt.store.save_memory_state("g1", "U1", cross, [], mode="chat")
+        rt.store.save_memory_state("g2", "U1", current, [], mode="chat")
+        msg = GroupMessage(
+            "g2", "m2", "member", "id", "在吗", "", 0,
+            mentioned=True, union_openid="U1",
+        )
+        asyncio.run(rt._generate(msg))
+        system = seen[0][0].content
+        self.assertIn(current, system)
+        self.assertIn(cross, system)
+        self.assertEqual(
+            rt.store.get_summary("g2", "U1", "chat"), current
+        )
+
     def _rt(self, **cfg_kw):
         import pathlib
         import tempfile
@@ -3814,7 +3846,8 @@ class TestBatchFeatures(unittest.TestCase):
         text = prompts.compose(enabled.cfg)
         self.assertIn("【人设锚点】", text)
         self.assertIn("老油条", text)
-        self.assertIn("- 问题内容（权重）", prompts.PERSONA_CHECK_PROMPT)
+        self.assertIn("违反第N条", prompts.PERSONA_CHECK_PROMPT)
+        self.assertIn("严重程度", prompts.PERSONA_CHECK_PROMPT)
         self.assertNotIn("状态：", prompts.PERSONA_CHECK_PROMPT)
         status, note, weight = enabled._parse_persona_report(
             "报告：太像客服了，下一句短一点。\n权重：0.8"
@@ -4092,6 +4125,199 @@ class TestBatchFeatures(unittest.TestCase):
         self.assertNotIn(
             "persona_check_prompt", InstanceConfig.__dataclass_fields__
         )
+
+    def test_persona_check_sends_full_negative_prompt_and_checklist(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot import prompts
+
+        seen = []
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                seen.append(messages)
+                return SimpleNamespace(
+                    text="- 未发现问题（0.0）", usage={}
+                )
+
+        tail = "结尾标记：不要出现这句话"
+        negative = "不要客服腔。不要用表情。" + "不要啰嗦。" * 120 + tail
+        self.assertGreater(len(negative), 600)
+        rt = self._rt(
+            persona_guard_enabled=True,
+            persona_anchor="说话短。不要客服腔。",
+            negative_prompt=negative,
+        )
+        rt.provider = Provider()
+        asyncio.run(
+            rt._persona_check_report(
+                "g",
+                "chat",
+                [{"role": "assistant", "content": "你好，我在。"}],
+            )
+        )
+        user = seen[0][1].content
+        self.assertIn(tail, user)
+        self.assertIn("【检查清单】", user)
+        for index, item in enumerate(prompts.PERSONA_CHECK_ITEMS, 1):
+            self.assertIn(f"{index}. {item}", user)
+        self.assertIn("【人设锚点】\n说话短。不要客服腔。", user)
+
+    def test_persona_check_checklist_is_generic(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot import prompts
+
+        anchors = [
+            "你是一只猫。",
+            "Persona: a grumpy mechanic who speaks in short English sentences.",
+            "你是个话很少的人，喜欢用比喻，讨厌被追问。",
+        ]
+        expected = [
+            f"{i}. {item}"
+            for i, item in enumerate(prompts.PERSONA_CHECK_ITEMS, 1)
+        ]
+
+        for anchor in anchors:
+            seen = []
+
+            class Provider:
+                id = "openai"
+
+                async def complete(self, messages, **kw):
+                    seen.append(messages)
+                    return SimpleNamespace(
+                        text="- 未发现问题（0.0）", usage={}
+                    )
+
+            rt = self._rt(persona_guard_enabled=True, persona_anchor=anchor)
+            rt.provider = Provider()
+            asyncio.run(
+                rt._persona_check_report(
+                    "g",
+                    "chat",
+                    [{"role": "assistant", "content": "在。"}],
+                )
+            )
+            user = seen[0][1].content
+            for line in expected:
+                self.assertIn(line, user)
+            self.assertNotIn("1. 你是一只猫", user)
+
+    def test_persona_limits_match_ui_and_prompt(self):
+        import re
+        from qqbot import limits, prompts
+        from qqbot.config import InstanceConfig
+        from qqbot.ui.page import INDEX_HTML
+
+        fields = (
+            ("psName", limits.BOT_NAME, "input"),
+            ("psPersona", limits.PERSONA, "textarea"),
+            ("psNegative", limits.NEGATIVE_PROMPT, "textarea"),
+            ("psStyle", limits.STYLE_PROMPT, "textarea"),
+            ("pgAnchor", limits.PERSONA_ANCHOR, "textarea"),
+        )
+        for field_id, limit, tag in fields:
+            match = re.search(
+                rf'<{tag} id="{field_id}"[^>]*>', INDEX_HTML, re.S
+            )
+            self.assertIsNotNone(match, field_id)
+            self.assertIn(f'maxlength="{limit}"', match.group(0))
+
+        samples = {
+            "persona": "设" * (limits.PERSONA - 1) + "人",
+            "persona_anchor": "锚" * (limits.PERSONA_ANCHOR - 1) + "点",
+            "negative_prompt": "禁" * (limits.NEGATIVE_PROMPT - 1) + "止",
+            "style_prompt": "风" * (limits.STYLE_PROMPT - 1) + "格",
+        }
+        cfg = InstanceConfig(persona_guard_enabled=True, **samples)
+        text = prompts.compose(cfg)
+        for value in samples.values():
+            self.assertIn(value, text)
+
+    def test_persona_check_uses_full_persona_without_anchor(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot import limits
+
+        seen = []
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                seen.append(messages)
+                return SimpleNamespace(
+                    text="- 未发现问题（0.0）", usage={}
+                )
+
+        tail = "人设最后一句"
+        rt = self._rt(
+            persona_guard_enabled=True,
+            persona="设" * (limits.PERSONA - len(tail)) + tail,
+        )
+        rt.provider = Provider()
+        asyncio.run(
+            rt._persona_check_report(
+                "g",
+                "chat",
+                [{"role": "assistant", "content": "在。"}],
+            )
+        )
+        self.assertIn(tail, seen[0][1].content)
+
+    def test_persona_check_checklist_weight_from_severity(self):
+        rt = self._rt()
+        status, note, weight = rt._parse_checklist_report(
+            "- 违反第1条：回复 63 字，超过 50 字上限｜一般\n"
+            "- 违反第2条：出现客服腔，原文「有什么可以帮您」｜严重\n"
+            "- 违反第2条：同一问题重复出现｜轻微"
+        )
+        self.assertEqual(status, "drift")
+        self.assertEqual(weight, 0.9)
+        self.assertIn("回复 63 字", note)
+        self.assertIn("（0.6）", note)
+        self.assertIn("（0.9）", note)
+        self.assertNotIn("第1条", note)
+        self.assertEqual(note.count("客服腔"), 1)
+        self.assertIsNone(rt._parse_checklist_report("- 未发现问题（0.0）"))
+
+    def test_persona_check_report_uses_checklist_result(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                return SimpleNamespace(
+                    text="- 违反第2条：用了客服腔，原文「有什么可以帮您」｜一般",
+                    usage={},
+                )
+
+        rt = self._rt(
+            persona_guard_enabled=True,
+            persona_anchor="说话短。不要客服腔。",
+        )
+        rt.provider = Provider()
+        result = asyncio.run(
+            rt._persona_check_report(
+                "g",
+                "chat",
+                [
+                    {
+                        "role": "assistant",
+                        "content": "您好，请问有什么可以帮您？",
+                    }
+                ],
+            )
+        )
+        self.assertEqual(result["status"], "drift")
+        self.assertEqual(result["weight"], 0.6)
+        self.assertIn("客服腔", result["note"])
+        self.assertIn("（0.6）", result["note"])
 
     def test_persona_report_manual_edit(self):
         rt = self._rt()

@@ -452,7 +452,7 @@ def create_app(rt: Runtime) -> FastAPI:
             raise HTTPException(status_code=400, detail="缺少群或成员标识")
         if not summary:
             raise HTTPException(status_code=400, detail="内容不能为空")
-        rt.store.save_memory_state(group, member, summary[:1500], [], mode=mode)
+        rt.store.save_memory_state(group, member, summary, [], mode=mode)
         rt.store.audit(
             "memory.item.update",
             target=f"{group[-6:]}/{member[-6:]}/{mode}",

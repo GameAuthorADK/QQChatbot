@@ -366,10 +366,10 @@ INDEX_HTML = r"""<!doctype html>
         <div id="personaFields" style="margin-top:10px">
           <div class="field">
             <label>人设锚点</label>
-            <textarea id="pgAnchor" rows="5"
+            <textarea id="pgAnchor" rows="5" maxlength="1000"
               placeholder="写最核心的身份、语气和禁忌，每轮都会固定注入。"></textarea>
             <span class="hint">
-              建议 50–300 字，只写不能变的部分。启用后每轮都会拼在人设后面。
+              建议 50–300 字，只写不能变的部分。启用后每轮都会拼在人设后面。上限 1000 字。
             </span>
           </div>
           <div class="field">
