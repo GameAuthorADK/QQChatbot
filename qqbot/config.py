@@ -87,6 +87,7 @@ class InstanceConfig:
     proactive_idle_s: int = 300
     proactive_daily_limit: int = 5
     proactive_reply_window_s: int = 900
+    proactive_judge_max_users: int = 3
     proactive_prompt: str = (
         "根据最近的群聊，主动开一个轻松、适合群聊的话题。"
     )

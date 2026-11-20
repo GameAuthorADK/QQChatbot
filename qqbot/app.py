@@ -2596,36 +2596,48 @@ class Runtime:
         rs = self.reply_settings(msg.group_openid)
         member = self._memory_member(msg)
         window = max(0, int(self.cfg.proactive_reply_window_s or 0))
+        judge_max = max(0, int(self.cfg.proactive_judge_max_users or 0))
         if mode == "chat":
-            # 有人接着主动话题说话时，才把那条主动发言并入这个人的对话和记忆
-            # window=0 表示不限时间
+            # 有人接着主动话题说话时，才把那条主动发言并入这个人的对话和记忆。
+            # 同一个话题可以分别判断多个人，直到达到判断人数上限。
             try:
-                pending = self.store.pending_proactive(
-                    msg.group_openid, window
+                topic = self.store.active_proactive(
+                    msg.group_openid, member, window, judge_max
                 )
             except AttributeError:
-                pending = None
-            if pending:
+                topic = None
+            if topic:
                 try:
                     relevant = await self._proactive_relevant(
-                        pending["text"], msg.content or ""
+                        topic["text"], msg.content or ""
                     )
                     if relevant:
-                        dropped = self.store.append_turn(
-                            msg.group_openid,
-                            member,
-                            "",
-                            pending["text"],
-                            mode=mode,
-                            limit=self.cfg.history_limit,
+                        history = self.store.get_thread(
+                            msg.group_openid, member, mode
                         )
-                        if dropped and self.cfg.auto_summary:
-                            self._queue_summary(
-                                msg.group_openid, member, dropped, mode
+                        already = any(
+                            m.get("role") == "assistant"
+                            and str(m.get("content") or "") == topic["text"]
+                            for m in history
+                        )
+                        if not already:
+                            dropped = self.store.append_turn(
+                                msg.group_openid,
+                                member,
+                                "",
+                                topic["text"],
+                                mode=mode,
+                                limit=self.cfg.history_limit,
                             )
-                    self.store.mark_proactive_answered(
-                        pending["id"], member
+                            if dropped and self.cfg.auto_summary:
+                                self._queue_summary(
+                                    msg.group_openid, member, dropped, mode
+                                )
+                    judged = self.store.record_proactive_judgment(
+                        topic["id"], member, relevant
                     )
+                    if judge_max > 0 and judged >= judge_max:
+                        self.store.close_proactive(topic["id"], member)
                 except Exception:
                     log.warning("主动发言并入上下文失败", exc_info=True)
         history = self.store.get_thread(msg.group_openid, member, mode)
@@ -3522,6 +3534,7 @@ class Runtime:
             ("proactive_idle_s", 0, 86400),
             ("proactive_daily_limit", 0, 10000),
             ("proactive_reply_window_s", 0, 86400),
+            ("proactive_judge_max_users", 0, 100),
         ):
             if key not in data:
                 continue

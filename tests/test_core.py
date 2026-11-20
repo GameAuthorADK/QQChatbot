@@ -3601,7 +3601,8 @@ class TestBatchFeatures(unittest.TestCase):
         self.assertEqual(history[0]["role"], "assistant")
         self.assertEqual(history[0]["content"], "你们今晚吃什么")
         self.assertEqual(history[1]["role"], "user")
-        self.assertIsNone(rt.store.pending_proactive("g", 900))
+        self.assertIsNotNone(rt.store.pending_proactive("g", 900))
+        self.assertEqual(rt.store.proactive_judged_count(pending["id"]), 1)
 
     def test_proactive_ignored_when_user_changes_topic(self):
         import asyncio
@@ -3627,7 +3628,148 @@ class TestBatchFeatures(unittest.TestCase):
         self.assertNotIn(
             "你们今晚吃什么", [m.get("content") for m in history]
         )
+        still_open = rt.store.pending_proactive("g", 900)
+        self.assertIsNotNone(still_open)
+        self.assertEqual(rt.store.proactive_judged_count(still_open["id"]), 1)
+
+    def test_proactive_judges_multiple_users_up_to_limit(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot.events import GroupMessage
+
+        calls = []
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                if "话题相关性判断器" in messages[0].content:
+                    calls.append(messages)
+                    return SimpleNamespace(text="是", usage={})
+                return SimpleNamespace(text="行", usage={})
+
+        rt = self._rt(proactive_judge_max_users=2)
+        rt.provider = Provider()
+        asyncio.run(rt._send_active("g", "你们今晚吃什么"))
+        for member in ("m2", "m3", "m4"):
+            msg = GroupMessage(
+                "g", member, "member", "id-" + member, "吃面", "", 0,
+                mentioned=True,
+            )
+            asyncio.run(rt._generate(msg))
+
+        self.assertEqual(len(calls), 2)
+        included = [
+            "你们今晚吃什么"
+            in [m.get("content") for m in rt.store.get_thread("g", member, "chat")]
+            for member in ("m2", "m3", "m4")
+        ]
+        self.assertEqual(included, [True, True, False])
         self.assertIsNone(rt.store.pending_proactive("g", 900))
+
+    def test_proactive_same_user_judged_once(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot.events import GroupMessage
+
+        calls = []
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                if "话题相关性判断器" in messages[0].content:
+                    calls.append(messages)
+                    return SimpleNamespace(text="是", usage={})
+                return SimpleNamespace(text="行", usage={})
+
+        rt = self._rt()
+        rt.provider = Provider()
+        asyncio.run(rt._send_active("g", "你们今晚吃什么"))
+        for _ in range(2):
+            msg = GroupMessage(
+                "g", "m2", "member", "id", "吃面", "", 0, mentioned=True
+            )
+            asyncio.run(rt._generate(msg))
+
+        self.assertEqual(len(calls), 1)
+        contents = [
+            m.get("content")
+            for m in rt.store.get_thread("g", "m2", "chat")
+        ]
+        self.assertEqual(contents.count("你们今晚吃什么"), 1)
+
+    def test_proactive_judge_limit_counts_irrelevant(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot.events import GroupMessage
+
+        calls = []
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                if "话题相关性判断器" in messages[0].content:
+                    calls.append(messages)
+                    return SimpleNamespace(text="否", usage={})
+                return SimpleNamespace(text="行", usage={})
+
+        rt = self._rt(proactive_judge_max_users=1)
+        rt.provider = Provider()
+        asyncio.run(rt._send_active("g", "你们今晚吃什么"))
+        first = GroupMessage(
+            "g", "m2", "member", "id2", "今天加班好累", "", 0,
+            mentioned=True,
+        )
+        asyncio.run(rt._generate(first))
+        second = GroupMessage(
+            "g", "m3", "member", "id3", "吃面", "", 0, mentioned=True
+        )
+        asyncio.run(rt._generate(second))
+
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn(
+            "你们今晚吃什么",
+            [m.get("content") for m in rt.store.get_thread("g", "m3", "chat")],
+        )
+
+    def test_proactive_judge_max_zero_unlimited(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot.events import GroupMessage
+
+        calls = []
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                if "话题相关性判断器" in messages[0].content:
+                    calls.append(messages)
+                    return SimpleNamespace(text="是", usage={})
+                return SimpleNamespace(text="行", usage={})
+
+        rt = self._rt(proactive_judge_max_users=0)
+        rt.provider = Provider()
+        asyncio.run(rt._send_active("g", "你们今晚吃什么"))
+        for member in ("m2", "m3", "m4"):
+            msg = GroupMessage(
+                "g", member, "member", "id-" + member, "吃面", "", 0,
+                mentioned=True,
+            )
+            asyncio.run(rt._generate(msg))
+
+        self.assertEqual(len(calls), 3)
+        for member in ("m2", "m3", "m4"):
+            self.assertIn(
+                "你们今晚吃什么",
+                [
+                    m.get("content")
+                    for m in rt.store.get_thread("g", member, "chat")
+                ],
+            )
+        self.assertIsNotNone(rt.store.pending_proactive("g", 900))
 
     def test_proactive_window_zero_means_unlimited(self):
         import asyncio

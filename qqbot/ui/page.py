@@ -623,6 +623,13 @@ INDEX_HTML = r"""<!doctype html>
                 主动发言后多久内的用户消息算接话，超过就不并入记忆。0 表示不限时间。
               </span>
             </div>
+            <div class="field">
+              <label>判断人数上限</label>
+              <input id="gPrJudgeMax" type="number" min="0" max="100" step="1">
+              <span class="hint">
+                同一个主动话题最多判断几个用户是否接话；0 表示不限制。
+              </span>
+            </div>
           </div>
           <div class="field">
             <label>默认主动话题提示词</label>
@@ -1521,6 +1528,7 @@ async function refresh() {
       $("gPrIdle").value = lc.proactive_idle_s ?? 300;
       $("gPrDaily").value = lc.proactive_daily_limit ?? 5;
       $("gPrWindow").value = lc.proactive_reply_window_s ?? 900;
+      $("gPrJudgeMax").value = lc.proactive_judge_max_users ?? 3;
       $("gPrPrompt").value = lc.proactive_prompt || "";
       $("rpRepeatProb").value = lc.repeat_probability ?? 10;
       $("rpRepeatCooldown").value = lc.repeat_cooldown_s ?? 60;
@@ -2266,6 +2274,7 @@ $("gPrSave").onclick = async () => {
       proactive_idle_s: Number($("gPrIdle").value) || 0,
       proactive_daily_limit: Number($("gPrDaily").value) || 0,
       proactive_reply_window_s: Number($("gPrWindow").value) || 0,
+      proactive_judge_max_users: Number($("gPrJudgeMax").value) || 0,
       proactive_prompt: $("gPrPrompt").value,
     })});
     $("gPrMsg").textContent = "已保存";

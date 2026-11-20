@@ -200,6 +200,15 @@ CREATE TABLE IF NOT EXISTS proactive_log (
 CREATE INDEX IF NOT EXISTS idx_proactive_log_group
     ON proactive_log(group_openid, ts);
 
+-- 主动话题的接话判断记录：同一个话题可以分别判断多个人
+CREATE TABLE IF NOT EXISTS proactive_judged (
+    topic_id      INTEGER NOT NULL,
+    member_openid TEXT NOT NULL,
+    relevant      INTEGER NOT NULL DEFAULT 0,
+    ts            REAL NOT NULL,
+    PRIMARY KEY (topic_id, member_openid)
+);
+
 -- 插件私有状态：插件自己决定 scope / key / value 的格式
 CREATE TABLE IF NOT EXISTS plugin_kv (
     plugin_id  TEXT NOT NULL,
@@ -787,6 +796,11 @@ class Store:
                 "ORDER BY id DESC LIMIT 50)",
                 (group_openid, group_openid),
             )
+            # 清掉已经被删掉的话题对应的判断记录
+            self.conn.execute(
+                "DELETE FROM proactive_judged WHERE topic_id NOT IN "
+                "(SELECT id FROM proactive_log)"
+            )
             self.conn.commit()
         return row_id
 
@@ -823,6 +837,91 @@ class Store:
                 "UPDATE proactive_log SET answered_at=?, answered_by=? "
                 "WHERE id=? AND answered_at=0",
                 (time.time(), member_openid or "", int(row_id)),
+            )
+            self.conn.commit()
+
+    def active_proactive(
+        self,
+        group_openid: str,
+        member_openid: str,
+        max_age: float = 900.0,
+        max_users: int = 3,
+    ) -> dict | None:
+        """还能继续判断接话的主动话题。
+
+        - 已经判断过这个成员的话题不再返回
+        - max_age <= 0 表示不限时间
+        - max_users <= 0 表示不限人数
+        """
+        sql = (
+            "SELECT p.id,p.text,p.ts FROM proactive_log p "
+            "WHERE p.group_openid=? AND p.answered_at=0 "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM proactive_judged j "
+            "WHERE j.topic_id=p.id AND j.member_openid=?)"
+        )
+        args: list = [group_openid, member_openid or ""]
+        if float(max_age or 0) > 0:
+            sql += " AND p.ts>=?"
+            args.append(time.time() - float(max_age))
+        if int(max_users or 0) > 0:
+            sql += (
+                " AND (SELECT COUNT(*) FROM proactive_judged j2 "
+                "WHERE j2.topic_id=p.id) < ?"
+            )
+            args.append(int(max_users))
+        sql += " ORDER BY p.id DESC LIMIT 1"
+        with self._lock:
+            row = self.conn.execute(sql, args).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row[0]),
+            "text": row[1] or "",
+            "ts": float(row[2] or 0),
+        }
+
+    def record_proactive_judgment(
+        self, topic_id: int, member_openid: str, relevant: bool
+    ) -> int:
+        """记录某个成员对主动话题的判断，返回已判断人数。"""
+        if not topic_id:
+            return 0
+        with self._lock:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO proactive_judged"
+                "(topic_id,member_openid,relevant,ts) VALUES(?,?,?,?)",
+                (
+                    int(topic_id),
+                    member_openid or "",
+                    1 if relevant else 0,
+                    time.time(),
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM proactive_judged WHERE topic_id=?",
+                (int(topic_id),),
+            ).fetchone()
+            self.conn.commit()
+        return int(row[0] or 0) if row else 0
+
+    def proactive_judged_count(self, topic_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM proactive_judged WHERE topic_id=?",
+                (int(topic_id),),
+            ).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def close_proactive(self, topic_id: int, member_openid: str = "") -> None:
+        """关闭话题，之后不再判断其他人是否接话。"""
+        if not topic_id:
+            return
+        with self._lock:
+            self.conn.execute(
+                "UPDATE proactive_log SET answered_at=?, answered_by=? "
+                "WHERE id=? AND answered_at=0",
+                (time.time(), member_openid or "", int(topic_id)),
             )
             self.conn.commit()
 
@@ -1614,6 +1713,7 @@ class Store:
             "wiki_cache",
             "proactive_state",
             "proactive_log",
+            "proactive_judged",
             "plugin_kv",
         ]
         with self._lock:
