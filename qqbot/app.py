@@ -2596,8 +2596,9 @@ class Runtime:
         rs = self.reply_settings(msg.group_openid)
         member = self._memory_member(msg)
         window = max(0, int(self.cfg.proactive_reply_window_s or 0))
-        if mode == "chat" and window > 0:
+        if mode == "chat":
             # 有人接着主动话题说话时，才把那条主动发言并入这个人的对话和记忆
+            # window=0 表示不限时间
             try:
                 pending = self.store.pending_proactive(
                     msg.group_openid, window

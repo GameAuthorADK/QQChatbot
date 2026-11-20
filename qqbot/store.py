@@ -793,15 +793,18 @@ class Store:
     def pending_proactive(
         self, group_openid: str, max_age: float = 900.0
     ) -> dict | None:
-        """最近一条还没人接、且没超过时限的主动发言。"""
-        cutoff = time.time() - max(0.0, float(max_age))
+        """最近一条还没人接的主动发言；max_age <= 0 表示不限时间。"""
+        sql = (
+            "SELECT id,text,ts FROM proactive_log "
+            "WHERE group_openid=? AND answered_at=0"
+        )
+        args: list = [group_openid]
+        if float(max_age or 0) > 0:
+            sql += " AND ts>=?"
+            args.append(time.time() - float(max_age))
+        sql += " ORDER BY id DESC LIMIT 1"
         with self._lock:
-            row = self.conn.execute(
-                "SELECT id,text,ts FROM proactive_log "
-                "WHERE group_openid=? AND answered_at=0 AND ts>=? "
-                "ORDER BY id DESC LIMIT 1",
-                (group_openid, cutoff),
-            ).fetchone()
+            row = self.conn.execute(sql, args).fetchone()
         if not row:
             return None
         return {

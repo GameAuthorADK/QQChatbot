@@ -3629,7 +3629,7 @@ class TestBatchFeatures(unittest.TestCase):
         )
         self.assertIsNone(rt.store.pending_proactive("g", 900))
 
-    def test_proactive_window_setting_zero_disables_memory(self):
+    def test_proactive_window_zero_means_unlimited(self):
         import asyncio
         from types import SimpleNamespace
         from qqbot.events import GroupMessage
@@ -3643,14 +3643,19 @@ class TestBatchFeatures(unittest.TestCase):
         rt = self._rt(proactive_reply_window_s=0)
         rt.provider = Provider()
         asyncio.run(rt._send_active("g", "你们今晚吃什么"))
+        row = rt.store.conn.execute(
+            "SELECT id FROM proactive_log"
+        ).fetchone()
+        rt.store.conn.execute(
+            "UPDATE proactive_log SET ts=ts-86400 WHERE id=?", (row[0],)
+        )
+        rt.store.conn.commit()
         msg = GroupMessage(
             "g", "m2", "member", "id", "吃面", "", 0, mentioned=True
         )
         asyncio.run(rt._generate(msg))
         history = rt.store.get_thread("g", "m2", "chat")
-        self.assertNotIn(
-            "你们今晚吃什么", [m.get("content") for m in history]
-        )
+        self.assertEqual(history[0]["content"], "你们今晚吃什么")
 
     def test_pending_proactive_expires(self):
         rt = self._rt()
@@ -3662,6 +3667,7 @@ class TestBatchFeatures(unittest.TestCase):
         )
         rt.store.conn.commit()
         self.assertIsNone(rt.store.pending_proactive("g", 600))
+        self.assertIsNotNone(rt.store.pending_proactive("g", 0))
 
     def test_new_proactive_replaces_pending(self):
         rt = self._rt()

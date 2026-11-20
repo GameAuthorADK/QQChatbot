@@ -620,7 +620,7 @@ INDEX_HTML = r"""<!doctype html>
               <label>接话时限（秒）</label>
               <input id="gPrWindow" type="number" min="0" max="86400" step="30">
               <span class="hint">
-                主动发言后多久内的用户消息算接话，超过就不并入记忆。0 表示不并入。
+                主动发言后多久内的用户消息算接话，超过就不并入记忆。0 表示不限时间。
               </span>
             </div>
           </div>
