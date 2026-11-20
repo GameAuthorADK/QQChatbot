@@ -3569,6 +3569,133 @@ class TestBatchFeatures(unittest.TestCase):
             rt.store.get_summary("g2", "U1", "chat"), current
         )
 
+    def test_proactive_only_enters_memory_after_reply(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot.events import GroupMessage
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                if "话题相关性判断器" in messages[0].content:
+                    return SimpleNamespace(text="是", usage={})
+                return SimpleNamespace(text="行", usage={})
+
+        rt = self._rt()
+        rt.provider = Provider()
+        asyncio.run(rt._send_active("g", "你们今晚吃什么"))
+
+        # 没人接话：不写进任何人的对话和记忆
+        self.assertEqual(rt.store.get_thread("g", "m2", "chat"), [])
+        pending = rt.store.pending_proactive("g", 900)
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["text"], "你们今晚吃什么")
+
+        # 有人接话：主动发言并入这个人的对话，之后会进入记忆整理
+        msg = GroupMessage(
+            "g", "m2", "member", "id", "吃面", "", 0, mentioned=True
+        )
+        asyncio.run(rt._generate(msg))
+        history = rt.store.get_thread("g", "m2", "chat")
+        self.assertEqual(history[0]["role"], "assistant")
+        self.assertEqual(history[0]["content"], "你们今晚吃什么")
+        self.assertEqual(history[1]["role"], "user")
+        self.assertIsNone(rt.store.pending_proactive("g", 900))
+
+    def test_proactive_ignored_when_user_changes_topic(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot.events import GroupMessage
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                if "话题相关性判断器" in messages[0].content:
+                    return SimpleNamespace(text="否", usage={})
+                return SimpleNamespace(text="行", usage={})
+
+        rt = self._rt()
+        rt.provider = Provider()
+        asyncio.run(rt._send_active("g", "你们今晚吃什么"))
+        msg = GroupMessage(
+            "g", "m2", "member", "id", "今天加班好累", "", 0, mentioned=True
+        )
+        asyncio.run(rt._generate(msg))
+        history = rt.store.get_thread("g", "m2", "chat")
+        self.assertNotIn(
+            "你们今晚吃什么", [m.get("content") for m in history]
+        )
+        self.assertIsNone(rt.store.pending_proactive("g", 900))
+
+    def test_proactive_window_setting_zero_disables_memory(self):
+        import asyncio
+        from types import SimpleNamespace
+        from qqbot.events import GroupMessage
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                return SimpleNamespace(text="行", usage={})
+
+        rt = self._rt(proactive_reply_window_s=0)
+        rt.provider = Provider()
+        asyncio.run(rt._send_active("g", "你们今晚吃什么"))
+        msg = GroupMessage(
+            "g", "m2", "member", "id", "吃面", "", 0, mentioned=True
+        )
+        asyncio.run(rt._generate(msg))
+        history = rt.store.get_thread("g", "m2", "chat")
+        self.assertNotIn(
+            "你们今晚吃什么", [m.get("content") for m in history]
+        )
+
+    def test_pending_proactive_expires(self):
+        rt = self._rt()
+        row_id = rt.store.log_proactive("g", "话题")
+        self.assertTrue(row_id)
+        self.assertIsNotNone(rt.store.pending_proactive("g", 3600))
+        rt.store.conn.execute(
+            "UPDATE proactive_log SET ts=ts-1000 WHERE id=?", (row_id,)
+        )
+        rt.store.conn.commit()
+        self.assertIsNone(rt.store.pending_proactive("g", 600))
+
+    def test_new_proactive_replaces_pending(self):
+        rt = self._rt()
+        first = rt.store.log_proactive("g", "话题一")
+        second = rt.store.log_proactive("g", "话题二")
+        pending = rt.store.pending_proactive("g", 900)
+        self.assertEqual(pending["id"], second)
+        self.assertNotEqual(first, second)
+        recent = rt.store.recent_proactive("g", max_age=900, limit=2)
+        self.assertEqual(
+            [item["text"] for item in recent], ["话题一", "话题二"]
+        )
+
+    def test_proactive_prompt_includes_own_recent_messages(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        seen = []
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                seen.append(messages)
+                return SimpleNamespace(text="今晚吃啥", usage={})
+
+        rt = self._rt()
+        rt.provider = Provider()
+        rt.store.log_proactive("g", "昨天那个话题")
+        asyncio.run(rt._do_proactive("g"))
+        system = seen[0][0].content
+        self.assertIn("【我最近在群里主动说过】", system)
+        self.assertIn("昨天那个话题", system)
+
     def _rt(self, **cfg_kw):
         import pathlib
         import tempfile

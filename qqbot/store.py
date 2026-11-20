@@ -188,6 +188,18 @@ CREATE TABLE IF NOT EXISTS proactive_state (
     last_at      REAL NOT NULL DEFAULT 0
 );
 
+-- 主动发言日志：只用来判断有没有人接这个话题
+CREATE TABLE IF NOT EXISTS proactive_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_openid TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    ts           REAL NOT NULL,
+    answered_at  REAL NOT NULL DEFAULT 0,
+    answered_by  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_proactive_log_group
+    ON proactive_log(group_openid, ts);
+
 -- 插件私有状态：插件自己决定 scope / key / value 的格式
 CREATE TABLE IF NOT EXISTS plugin_kv (
     plugin_id  TEXT NOT NULL,
@@ -745,6 +757,98 @@ class Store:
                 (group_openid, date, time.time()),
             )
             self.conn.commit()
+
+    def log_proactive(self, group_openid: str, text: str) -> int:
+        """记录一条已发出的主动发言，只用于判断有没有人接话。
+
+        不写进 `threads`，所以没人接话时不会进入任何人的记忆。
+        """
+        text = (text or "").strip()
+        if not text:
+            return 0
+        now = time.time()
+        with self._lock:
+            # 新话题发出后，之前的待接话记录作废
+            self.conn.execute(
+                "UPDATE proactive_log SET answered_at=? "
+                "WHERE group_openid=? AND answered_at=0",
+                (now, group_openid),
+            )
+            cur = self.conn.execute(
+                "INSERT INTO proactive_log(group_openid,text,ts) "
+                "VALUES(?,?,?)",
+                (group_openid, text, now),
+            )
+            row_id = int(cur.lastrowid or 0)
+            # 每个群只保留最近 50 条
+            self.conn.execute(
+                "DELETE FROM proactive_log WHERE group_openid=? AND id NOT IN "
+                "(SELECT id FROM proactive_log WHERE group_openid=? "
+                "ORDER BY id DESC LIMIT 50)",
+                (group_openid, group_openid),
+            )
+            self.conn.commit()
+        return row_id
+
+    def pending_proactive(
+        self, group_openid: str, max_age: float = 900.0
+    ) -> dict | None:
+        """最近一条还没人接、且没超过时限的主动发言。"""
+        cutoff = time.time() - max(0.0, float(max_age))
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT id,text,ts FROM proactive_log "
+                "WHERE group_openid=? AND answered_at=0 AND ts>=? "
+                "ORDER BY id DESC LIMIT 1",
+                (group_openid, cutoff),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row[0]),
+            "text": row[1] or "",
+            "ts": float(row[2] or 0),
+        }
+
+    def mark_proactive_answered(
+        self, row_id: int, member_openid: str = ""
+    ) -> None:
+        if not row_id:
+            return
+        with self._lock:
+            self.conn.execute(
+                "UPDATE proactive_log SET answered_at=?, answered_by=? "
+                "WHERE id=? AND answered_at=0",
+                (time.time(), member_openid or "", int(row_id)),
+            )
+            self.conn.commit()
+
+    def recent_proactive(
+        self,
+        group_openid: str,
+        *,
+        max_age: float = 7200.0,
+        limit: int = 2,
+    ) -> list[dict]:
+        """最近发给这个群的主动发言，供机器人回忆自己说过什么。"""
+        cutoff = time.time() - max(0.0, float(max_age))
+        limit = max(1, min(10, int(limit)))
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id,text,ts,answered_at FROM proactive_log "
+                "WHERE group_openid=? AND ts>=? "
+                "ORDER BY id DESC LIMIT ?",
+                (group_openid, cutoff, limit),
+            ).fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "text": r[1] or "",
+                "ts": float(r[2] or 0),
+                "answered_at": float(r[3] or 0),
+            }
+            for r in reversed(rows)
+        ]
 
     def plugin_get(
         self,
@@ -1506,6 +1610,7 @@ class Store:
             "mode_notices",
             "wiki_cache",
             "proactive_state",
+            "proactive_log",
             "plugin_kv",
         ]
         with self._lock:

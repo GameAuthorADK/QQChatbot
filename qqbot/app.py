@@ -70,6 +70,10 @@ SUMMARY_MAX_PENDING = 200
 SUMMARY_MIN_MESSAGES = 60
 #: 自检时最多看多少条最近的机器人回复
 PERSONA_RECENT_MAX = 10
+#: 机器人回忆自己主动发言的时间窗口
+PROACTIVE_CONTEXT_WINDOW_S = 2 * 3600
+#: 注入多少条自己的主动发言
+PROACTIVE_CONTEXT_MAX = 2
 #: 自检模型给出的严重程度换算成报告权重，避免它自己随手打分
 PERSONA_CHECK_WEIGHTS = {"严重": 0.9, "一般": 0.6, "轻微": 0.3}
 #: 「- 违反第 N 条：问题｜严重程度」
@@ -1830,12 +1834,62 @@ class Runtime:
             await sender.send_group_text(group, text)
             self.reply_count += 1
             self._remember_assistant(group, text)
+            try:
+                self.store.log_proactive(group, text)
+            except Exception:
+                log.warning("主动发言记录失败", exc_info=True)
             log.info("主动发言 group=%s len=%d", group[-4:], len(text))
             return True
         except Exception as exc:
             self.error = str(exc)
             log.warning("主动发言失败：%s", exc)
             return False
+
+    async def _proactive_relevant(
+        self, proactive: str, user_text: str
+    ) -> bool:
+        """判断用户这句话是不是在接机器人刚提出的主动话题。
+
+        只让模型回答「是 / 否」；失败时按接话处理，退回时间窗口的行为。
+        """
+        provider = self.provider
+        topic = str(proactive or "").strip()
+        text = str(user_text or "").strip()
+        if provider is None or not topic or not text:
+            return True
+        prompt = (
+            "判断用户这句话是不是在接机器人刚才主动提出的话题。\n"
+            "只回答「是」或「否」，不要解释。\n\n"
+            f"【机器人刚才主动说】\n{topic[:500]}\n\n"
+            f"【用户现在说】\n{text[:500]}"
+        )
+        timeout = min(10, max(3, int(self.cfg.timeout_s or 20)))
+        try:
+            comp = await asyncio.wait_for(
+                provider.complete(
+                    [
+                        ChatMessage("system", "你是话题相关性判断器。"),
+                        ChatMessage("user", prompt),
+                    ],
+                    timeout=timeout,
+                    max_tokens=16,
+                ),
+                timeout=timeout + 1,
+            )
+        except Exception:
+            log.debug("主动话题相关性判断失败", exc_info=True)
+            return True
+        try:
+            self.quota.record_usage(
+                getattr(comp, "usage", {}),
+                getattr(provider, "id", ""),
+            )
+        except Exception:
+            pass
+        answer = re.sub(r"[\s。.!！?？,，]", "", (comp.text or ""))
+        if answer.startswith(("否", "不是", "无关", "没接")):
+            return False
+        return True
 
     async def _do_proactive(self, group: str) -> bool:
         """机器人自己开口，不是回复某条消息。"""
@@ -1869,6 +1923,18 @@ class Runtime:
                         for item in reports
                     ]
                     system += "\n\n【人设自检提醒】\n" + "\n".join(lines)[:900]
+            try:
+                recent = self.store.recent_proactive(
+                    group,
+                    max_age=PROACTIVE_CONTEXT_WINDOW_S,
+                    limit=PROACTIVE_CONTEXT_MAX,
+                )
+            except AttributeError:
+                recent = []
+            if recent:
+                system += "\n\n【我最近在群里主动说过】\n" + "\n".join(
+                    f"- {str(item.get('text') or '')}" for item in recent
+                )
             context = self._listen_context(group).strip()
             user = context or "群里现在比较安静，主动开一个轻松的话题。"
             try:
@@ -2529,6 +2595,38 @@ class Runtime:
         mode = spec.id if spec is not None else "chat"
         rs = self.reply_settings(msg.group_openid)
         member = self._memory_member(msg)
+        window = max(0, int(self.cfg.proactive_reply_window_s or 0))
+        if mode == "chat" and window > 0:
+            # 有人接着主动话题说话时，才把那条主动发言并入这个人的对话和记忆
+            try:
+                pending = self.store.pending_proactive(
+                    msg.group_openid, window
+                )
+            except AttributeError:
+                pending = None
+            if pending:
+                try:
+                    relevant = await self._proactive_relevant(
+                        pending["text"], msg.content or ""
+                    )
+                    if relevant:
+                        dropped = self.store.append_turn(
+                            msg.group_openid,
+                            member,
+                            "",
+                            pending["text"],
+                            mode=mode,
+                            limit=self.cfg.history_limit,
+                        )
+                        if dropped and self.cfg.auto_summary:
+                            self._queue_summary(
+                                msg.group_openid, member, dropped, mode
+                            )
+                    self.store.mark_proactive_answered(
+                        pending["id"], member
+                    )
+                except Exception:
+                    log.warning("主动发言并入上下文失败", exc_info=True)
         history = self.store.get_thread(msg.group_openid, member, mode)
         summary = self.store.get_summary(msg.group_openid, member, mode)
         system = prompts.compose(self.cfg)
@@ -2550,6 +2648,28 @@ class Runtime:
                 for item in cross
             ]
             system += "\n\n【该用户在其他群的记忆】\n" + "\n".join(lines)
+        if mode == "chat":
+            try:
+                recent = self.store.recent_proactive(
+                    msg.group_openid,
+                    max_age=PROACTIVE_CONTEXT_WINDOW_S,
+                    limit=PROACTIVE_CONTEXT_MAX,
+                )
+            except AttributeError:
+                recent = []
+            if recent:
+                in_history = {
+                    str(m.get("content") or "") for m in history
+                }
+                lines = [
+                    f"- {str(item.get('text') or '')}"
+                    for item in recent
+                    if str(item.get("text") or "") not in in_history
+                ]
+                if lines:
+                    system += (
+                        "\n\n【我最近在群里主动说过】\n" + "\n".join(lines)
+                    )
         if self.cfg.persona_guard_enabled:
             reports = self.persona_mem().active_reports(
                 msg.group_openid, mode, 50
@@ -3400,6 +3520,7 @@ class Runtime:
             ("proactive_interval_s", 0, 86400),
             ("proactive_idle_s", 0, 86400),
             ("proactive_daily_limit", 0, 10000),
+            ("proactive_reply_window_s", 0, 86400),
         ):
             if key not in data:
                 continue

@@ -616,6 +616,13 @@ INDEX_HTML = r"""<!doctype html>
               <input id="gPrDaily" type="number" min="0" max="10000" step="1">
               <span class="hint">同一个群每天最多主动发言几次。0 表示不限制。</span>
             </div>
+            <div class="field">
+              <label>接话时限（秒）</label>
+              <input id="gPrWindow" type="number" min="0" max="86400" step="30">
+              <span class="hint">
+                主动发言后多久内的用户消息算接话，超过就不并入记忆。0 表示不并入。
+              </span>
+            </div>
           </div>
           <div class="field">
             <label>默认主动话题提示词</label>
@@ -1513,6 +1520,7 @@ async function refresh() {
       $("gPrInterval").value = lc.proactive_interval_s ?? 600;
       $("gPrIdle").value = lc.proactive_idle_s ?? 300;
       $("gPrDaily").value = lc.proactive_daily_limit ?? 5;
+      $("gPrWindow").value = lc.proactive_reply_window_s ?? 900;
       $("gPrPrompt").value = lc.proactive_prompt || "";
       $("rpRepeatProb").value = lc.repeat_probability ?? 10;
       $("rpRepeatCooldown").value = lc.repeat_cooldown_s ?? 60;
@@ -2257,6 +2265,7 @@ $("gPrSave").onclick = async () => {
       proactive_interval_s: Number($("gPrInterval").value) || 0,
       proactive_idle_s: Number($("gPrIdle").value) || 0,
       proactive_daily_limit: Number($("gPrDaily").value) || 0,
+      proactive_reply_window_s: Number($("gPrWindow").value) || 0,
       proactive_prompt: $("gPrPrompt").value,
     })});
     $("gPrMsg").textContent = "已保存";
