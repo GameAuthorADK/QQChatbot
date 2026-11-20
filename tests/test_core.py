@@ -3841,8 +3841,56 @@ class TestBatchFeatures(unittest.TestCase):
         rt.store.log_proactive("g", "昨天那个话题")
         asyncio.run(rt._do_proactive("g"))
         system = seen[0][0].content
-        self.assertIn("【我最近在群里主动说过】", system)
+        self.assertIn("【最近已经主动说过的话题，禁止重复】", system)
         self.assertIn("昨天那个话题", system)
+        self.assertIn("禁止重复", system)
+
+    def test_proactive_skips_duplicate_topic(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                return SimpleNamespace(text="昨天那个话题", usage={})
+
+        rt = self._rt()
+        rt.provider = Provider()
+        rt.store.log_proactive("g", "昨天那个话题")
+        result = asyncio.run(rt._do_proactive("g"))
+        self.assertFalse(result)
+        self.assertEqual(rt.sender.calls, [])
+
+    def test_proactive_retries_once_on_duplicate(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        class Provider:
+            id = "openai"
+
+            def __init__(self):
+                self.calls = 0
+
+            async def complete(self, messages, **kw):
+                self.calls += 1
+                if self.calls == 1:
+                    return SimpleNamespace(text="昨天那个话题", usage={})
+                return SimpleNamespace(text="今天换点别的", usage={})
+
+        rt = self._rt()
+        provider = Provider()
+        rt.provider = provider
+        rt.store.log_proactive("g", "昨天那个话题")
+        result = asyncio.run(rt._do_proactive("g"))
+        self.assertTrue(result)
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual(rt.sender.calls, ["今天换点别的"])
+        texts = [
+            item["text"]
+            for item in rt.store.recent_proactive("g", max_age=7200, limit=5)
+        ]
+        self.assertIn("今天换点别的", texts)
 
     def _rt(self, **cfg_kw):
         import pathlib

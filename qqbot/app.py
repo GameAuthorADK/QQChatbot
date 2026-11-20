@@ -12,6 +12,7 @@ import re
 import time
 from collections import deque
 from dataclasses import asdict, replace
+from difflib import SequenceMatcher
 from types import SimpleNamespace
 
 from . import cards, checks, config, errors, limits, prompts, secrets, wiki
@@ -1891,6 +1892,53 @@ class Runtime:
             return False
         return True
 
+    @staticmethod
+    def _topic_key(text: str) -> str:
+        return "".join(ch for ch in str(text or "") if ch.isalnum())
+
+    @classmethod
+    def _topic_duplicate(cls, text: str, recent: list[dict]) -> bool:
+        """和最近主动说过的话题相同，或只改了几个字。"""
+        key = cls._topic_key(text)
+        if not key:
+            return False
+        for item in recent:
+            other = cls._topic_key(item.get("text") or "")
+            if not other:
+                continue
+            if key == other:
+                return True
+            if SequenceMatcher(None, key, other).ratio() >= 0.85:
+                return True
+        return False
+
+    async def _proactive_complete(
+        self, provider, system: str, user: str
+    ) -> str:
+        comp = await asyncio.wait_for(
+            provider.complete(
+                [
+                    ChatMessage("system", system),
+                    ChatMessage("user", user),
+                ],
+                timeout=self.cfg.timeout_s,
+                max_tokens=120,
+            ),
+            timeout=self.cfg.timeout_s + 1,
+        )
+        try:
+            self.quota.record_usage(
+                getattr(comp, "usage", {}), getattr(provider, "id", "")
+            )
+        except Exception:
+            pass
+        text = (comp.text or "").strip()
+        while text.endswith("。"):
+            text = text[:-1].rstrip()
+        if len(text) > 120:
+            text = text[:119].rstrip() + "…"
+        return text
+
     async def _do_proactive(self, group: str) -> bool:
         """机器人自己开口，不是回复某条消息。"""
         busy = getattr(self, "_proactive_busy", None)
@@ -1908,7 +1956,7 @@ class Runtime:
             base = (rs.proactive_prompt or "").strip()
             if not base:
                 base = "根据最近的群聊，主动开一个轻松、适合群聊的话题。"
-            system = (
+            base_system = (
                 prompts.compose(self.cfg)
                 + "\n\n【主动发言】\n"
                 + base
@@ -1922,7 +1970,9 @@ class Runtime:
                         f"（{float(item.get('weight') or 0):.1f}）"
                         for item in reports
                     ]
-                    system += "\n\n【人设自检提醒】\n" + "\n".join(lines)[:900]
+                    base_system += (
+                        "\n\n【人设自检提醒】\n" + "\n".join(lines)[:900]
+                    )
             try:
                 recent = self.store.recent_proactive(
                     group,
@@ -1931,37 +1981,41 @@ class Runtime:
                 )
             except AttributeError:
                 recent = []
+            recent_block = ""
             if recent:
-                system += "\n\n【我最近在群里主动说过】\n" + "\n".join(
-                    f"- {str(item.get('text') or '')}" for item in recent
+                recent_block = (
+                    "\n\n【最近已经主动说过的话题，禁止重复】\n"
+                    + "\n".join(
+                        f"- {str(item.get('text') or '')}" for item in recent
+                    )
+                    + "\n不要原样重复，也不要只改几个字；必须换一个明显不同的话题。"
                 )
+            system = base_system + recent_block
             context = self._listen_context(group).strip()
             user = context or "群里现在比较安静，主动开一个轻松的话题。"
             try:
-                comp = await asyncio.wait_for(
-                    provider.complete(
-                        [
-                            ChatMessage("system", system),
-                            ChatMessage("user", user),
-                        ],
-                        timeout=self.cfg.timeout_s,
-                        max_tokens=120,
-                    ),
-                    timeout=self.cfg.timeout_s + 1,
+                text = await self._proactive_complete(
+                    provider, system, user
                 )
             except Exception:
                 return False
-            try:
-                self.quota.record_usage(
-                    getattr(comp, "usage", {}), getattr(provider, "id", "")
+            if text and self._topic_duplicate(text, recent):
+                log.info("主动发言与最近话题重复，重试 group=%s", group[-4:])
+                retry_system = (
+                    base_system
+                    + "\n\n【禁止重复】\n- "
+                    + text
+                    + "\n必须提出一个完全不同的话题，不能原样重复，也不能只改几个字。"
                 )
-            except Exception:
-                pass
-            text = (comp.text or "").strip()
-            while text.endswith("。"):
-                text = text[:-1].rstrip()
-            if len(text) > 120:
-                text = text[:119].rstrip() + "…"
+                try:
+                    text = await self._proactive_complete(
+                        provider, retry_system, user
+                    )
+                except Exception:
+                    return False
+                if text and self._topic_duplicate(text, recent):
+                    log.info("主动发言仍然重复，跳过 group=%s", group[-4:])
+                    return False
             if not text:
                 return False
             ok = await self._send_active(group, text)
