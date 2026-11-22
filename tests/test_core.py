@@ -3351,6 +3351,7 @@ class TestListenFlow(unittest.TestCase):
     def test_proactive_memory_has_recent_context(self):
         import asyncio
         from qqbot.events import GroupMessage
+        from qqbot.providers.base import Completion
 
         rt = self._rt(
             listen_enabled=True,
@@ -3359,6 +3360,16 @@ class TestListenFlow(unittest.TestCase):
             listen_cooldown_s=0,
             listen_daily_limit=0,
         )
+        seen = []
+
+        class Capture:
+            id = "openai"
+
+            async def complete(self, messages, *, timeout, max_tokens):
+                seen.append(messages)
+                return Completion(text="好", usage={})
+
+        rt.provider = Capture()
         m1 = GroupMessage("g", "m1", "member", "c1", "前面那句话", "", 1, mentioned=False)
         m2 = GroupMessage("g", "m2", "member", "c2", "另一句", "", 2, mentioned=False)
         asyncio.run(rt._handle_group_message(m1))
@@ -3368,12 +3379,22 @@ class TestListenFlow(unittest.TestCase):
         m3 = GroupMessage("g", "m", "member", "c3", "现在这句", "", 3, mentioned=False)
         asyncio.run(rt._handle_group_message(m3))
 
+        # 群友上下文只在本次提示词里，不写进当前用户的记忆
         thread = rt.store.get_thread("g", "m", "chat")
         self.assertEqual(len(thread), 2)
-        self.assertIn("【最近的群聊】", thread[0]["content"])
-        self.assertIn("前面那句话", thread[0]["content"])
-        self.assertIn("另一句", thread[0]["content"])
-        self.assertIn("现在这句", thread[0]["content"])
+        self.assertEqual(thread[0]["content"], "现在这句")
+        self.assertNotIn("前面那句话", thread[0]["content"])
+        self.assertNotIn("另一句", thread[0]["content"])
+
+        # 提示词里仍然带着群友上下文，并标明当前发言人
+        prompt = [
+            m.content for m in seen[-1] if m.role == "user"
+        ][-1]
+        self.assertIn("【最近的群聊｜背景", prompt)
+        self.assertIn("前面那句话", prompt)
+        self.assertIn("另一句", prompt)
+        self.assertIn("现在这句", prompt)
+        self.assertIn("【当前消息｜发言人：m", prompt)
 
     def test_proactive_ignores_commands(self):
         import asyncio

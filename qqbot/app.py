@@ -1706,7 +1706,10 @@ class Runtime:
         for member, text in list(buf)[-LISTEN_CONTEXT_MESSAGES:]:
             who = f"群友({member[-4:]})" if member else "群友"
             lines.append(f"{who}：{text}")
-        return "【最近的群聊】\n" + "\n".join(lines)
+        return (
+            "【最近的群聊｜背景，发言人是其他群友，不是当前用户】\n"
+            + "\n".join(lines)
+        )
 
     def _remember_recent(self, msg: GroupMessage) -> None:
         """把群消息放进内存环形缓冲，不落库，只给监听上下文用。"""
@@ -2749,12 +2752,17 @@ class Runtime:
                 ]
                 system += "\n\n【人设自检提醒】\n" + "\n".join(lines)[:900]
         current_text = msg.content or "[非文本消息]"
+        memory_text = current_text
         context = (context or "").strip()
-        user_text = (
-            f"{context}\n【当前消息】\n{current_text}"
-            if context
-            else current_text
-        )
+        if context:
+            speaker = (msg.member_openid or "")[-4:] or "当前用户"
+            user_text = (
+                f"{context}\n"
+                f"【当前消息｜发言人：{speaker}｜请回复这一条】\n"
+                f"{current_text}"
+            )
+        else:
+            user_text = current_text
         image_atts = [a for a in msg.attachments if a.kind == "image"]
         user_content: str | list = user_text
         if image_atts:
@@ -2768,6 +2776,7 @@ class Runtime:
                 return "图片没取到，可能是链接过期了，再发一次试试。"
             user_content = parts
             user_text = (user_text + " [图片]").strip()
+            memory_text = (memory_text + " [图片]").strip()
 
         messages = build_messages(system, history, user_content)
 
@@ -2784,7 +2793,7 @@ class Runtime:
             self.error = "E2003 模型超时"
             log.warning("模型超时（%.0fs），使用兜底话术", self.cfg.timeout_s)
             self._remember_exchange(
-                msg, mode, user_text, rs.fallback_reply
+                msg, mode, memory_text, rs.fallback_reply
             )
             return rs.fallback_reply
         except Exception as exc:
@@ -2805,7 +2814,7 @@ class Runtime:
                     f"图片没能交给模型：{reason}\n"
                     "可能是图片太大或格式不支持，压缩后再试；也可以点「测试看图」确认。"
                 )
-            self._remember_exchange(msg, mode, user_text, "")
+            self._remember_exchange(msg, mode, memory_text, "")
             return rs.fallback_reply
 
         reply = (comp.text or "").strip() or rs.fallback_reply
@@ -2815,7 +2824,7 @@ class Runtime:
             )
         except Exception:
             pass
-        self._remember_exchange(msg, mode, user_text, reply)
+        self._remember_exchange(msg, mode, memory_text, reply)
         self._maybe_persona_check(
             msg.group_openid, mode, history
         )
