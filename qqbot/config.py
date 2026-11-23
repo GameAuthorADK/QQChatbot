@@ -8,7 +8,7 @@ from pathlib import Path
 from . import yamlutil
 from .paths import INSTANCE_YAML
 
-DEFAULT_REPLY = "收到，我是测试用机器人。"
+DEFAULT_REPLY = "收到，我先看看。"
 
 #: 可在界面上调整的参数及其默认值（不要在这里放密钥/身份）
 DEFAULTS = {
@@ -41,7 +41,7 @@ class InstanceConfig:
     # 人设（安全底线在 prompts.py 里硬编码，不在此处）
     bot_name: str = "小助手"
     persona: str = "你是一个友善、简洁的群聊助手，回答直接，不说教。"
-    negative_prompt: str = "不要输出代码块；不要长篇大论；不要替用户做决定。"
+    negative_prompt: str = "回复保持简洁，不贴代码，不替用户拿主意。"
     #: 额外的回复风格要求，会拼在禁止事项之后
     style_prompt: str = ""
     # 长期记忆（用户可编辑，会拼进提示词）
@@ -89,7 +89,7 @@ class InstanceConfig:
     proactive_reply_window_s: int = 900
     proactive_judge_max_users: int = 3
     proactive_prompt: str = (
-        "根据最近的群聊，主动开一个轻松、适合群聊的话题。"
+        "结合群里的近况，主动开一个轻松、适合群聊的话题。"
     )
     # 内置插件：人设稳定
     persona_guard_enabled: bool = False

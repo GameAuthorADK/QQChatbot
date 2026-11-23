@@ -634,7 +634,7 @@ INDEX_HTML = r"""<!doctype html>
           <div class="field">
             <label>默认主动话题提示词</label>
             <textarea id="gPrPrompt" rows="4"
-              placeholder="根据最近的群聊，主动开一个轻松、适合群聊的话题。"></textarea>
+              placeholder="结合群里的近况，主动开一个轻松、适合群聊的话题。"></textarea>
           </div>
         </div>
         <div class="row">
@@ -830,7 +830,7 @@ INDEX_HTML = r"""<!doctype html>
           <div class="field">
             <label>本群主动话题提示词</label>
             <textarea id="prActivePrompt" rows="4"
-              placeholder="根据最近的群聊，主动开一个轻松、适合群聊的话题。"></textarea>
+              placeholder="结合群里的近况，主动开一个轻松、适合群聊的话题。"></textarea>
           </div>
         </div>
         <div class="row">

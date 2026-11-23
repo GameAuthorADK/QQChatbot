@@ -75,6 +75,14 @@ PERSONA_RECENT_MAX = 10
 PROACTIVE_CONTEXT_WINDOW_S = 2 * 3600
 #: 注入多少条自己的主动发言
 PROACTIVE_CONTEXT_MAX = 2
+#: 主动发言生成的 token 上限；给推理型模型留余量，避免话说到一半被截断
+PROACTIVE_MAX_TOKENS = 300
+#: 主动发言以这些字符结尾时，通常说明话没说完
+PROACTIVE_DANGLING = (
+    "出", "把", "被", "和", "跟", "与", "或", "而", "但", "却",
+    "从", "向", "就", "才", "又", "还", "也",
+    "，", ",", "、", "：", ":", "；", ";",
+)
 #: 自检模型给出的严重程度换算成报告权重，避免它自己随手打分
 PERSONA_CHECK_WEIGHTS = {"严重": 0.9, "一般": 0.6, "轻微": 0.3}
 #: 「- 违反第 N 条：问题｜严重程度」
@@ -1915,9 +1923,25 @@ class Runtime:
                 return True
         return False
 
+    @classmethod
+    def _proactive_incomplete(
+        cls, text: str, finish_reason: str = ""
+    ) -> bool:
+        """判断主动发言是不是话没说完。"""
+        if str(finish_reason or "") == "length":
+            return True
+        core = str(text or "").strip().rstrip("。！？!?…~～ ")
+        if not core:
+            return True
+        return core.endswith(PROACTIVE_DANGLING)
+
     async def _proactive_complete(
-        self, provider, system: str, user: str
-    ) -> str:
+        self,
+        provider,
+        system: str,
+        user: str,
+        max_tokens: int = PROACTIVE_MAX_TOKENS,
+    ) -> tuple[str, str]:
         comp = await asyncio.wait_for(
             provider.complete(
                 [
@@ -1925,7 +1949,7 @@ class Runtime:
                     ChatMessage("user", user),
                 ],
                 timeout=self.cfg.timeout_s,
-                max_tokens=120,
+                max_tokens=max_tokens,
             ),
             timeout=self.cfg.timeout_s + 1,
         )
@@ -1940,7 +1964,7 @@ class Runtime:
             text = text[:-1].rstrip()
         if len(text) > 120:
             text = text[:119].rstrip() + "…"
-        return text
+        return text, str(getattr(comp, "finish_reason", "") or "")
 
     async def _do_proactive(self, group: str) -> bool:
         """机器人自己开口，不是回复某条消息。"""
@@ -1958,12 +1982,12 @@ class Runtime:
             rs = self.reply_settings(group)
             base = (rs.proactive_prompt or "").strip()
             if not base:
-                base = "根据最近的群聊，主动开一个轻松、适合群聊的话题。"
+                base = "结合群里的近况，主动开一个轻松、适合群聊的话题。"
             base_system = (
                 prompts.compose(self.cfg)
                 + "\n\n【主动发言】\n"
                 + base
-                + "\n只输出一句，不超过 40 字，不 @ 人，不解释，不用句号结尾。"
+                + "\n只输出一句完整的话，不超过 40 字，不 @ 人，不解释。"
             )
             if self.cfg.persona_guard_enabled:
                 reports = self.persona_mem().active_reports(group, "chat", 50)
@@ -1997,27 +2021,56 @@ class Runtime:
             context = self._listen_context(group).strip()
             user = context or "群里现在比较安静，主动开一个轻松的话题。"
             try:
-                text = await self._proactive_complete(
+                text, finish = await self._proactive_complete(
                     provider, system, user
                 )
             except Exception:
                 return False
-            if text and self._topic_duplicate(text, recent):
-                log.info("主动发言与最近话题重复，重试 group=%s", group[-4:])
+            duplicate = bool(text and self._topic_duplicate(text, recent))
+            incomplete = bool(
+                text and self._proactive_incomplete(text, finish)
+            )
+            if duplicate or incomplete:
+                reasons = []
+                if duplicate:
+                    reasons.append("不要重复最近说过的话题")
+                if incomplete:
+                    reasons.append("上一句没有说完，必须是一句完整的话")
+                log.info(
+                    "主动发言不合格，重试 group=%s reasons=%s finish=%s",
+                    group[-4:],
+                    ",".join(reasons),
+                    finish or "-",
+                )
                 retry_system = (
                     base_system
-                    + "\n\n【禁止重复】\n- "
-                    + text
-                    + "\n必须提出一个完全不同的话题，不能原样重复，也不能只改几个字。"
+                    + "\n\n【本次必须修正】\n- "
+                    + "\n- ".join(reasons)
                 )
+                if text:
+                    retry_system += "\n不合格的上一句：" + text
+                if recent:
+                    retry_system += "\n最近说过的话题：\n" + "\n".join(
+                        f"- {str(item.get('text') or '')}" for item in recent
+                    )
                 try:
-                    text = await self._proactive_complete(
-                        provider, retry_system, user
+                    text, finish = await self._proactive_complete(
+                        provider,
+                        retry_system,
+                        user,
+                        max_tokens=PROACTIVE_MAX_TOKENS * 2,
                     )
                 except Exception:
                     return False
-                if text and self._topic_duplicate(text, recent):
-                    log.info("主动发言仍然重复，跳过 group=%s", group[-4:])
+                if text and (
+                    self._topic_duplicate(text, recent)
+                    or self._proactive_incomplete(text, finish)
+                ):
+                    log.info(
+                        "主动发言仍不合格，跳过 group=%s finish=%s",
+                        group[-4:],
+                        finish or "-",
+                    )
                     return False
             if not text:
                 return False

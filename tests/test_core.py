@@ -3913,6 +3913,87 @@ class TestBatchFeatures(unittest.TestCase):
         ]
         self.assertIn("今天换点别的", texts)
 
+    def test_proactive_retries_incomplete_topic(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        calls = []
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                calls.append(messages)
+                if len(calls) == 1:
+                    return SimpleNamespace(
+                        text="我今天修了个小装置，结果把螺丝拧出",
+                        usage={},
+                    )
+                return SimpleNamespace(
+                    text="我今天修了个小装置，结果把螺丝拧出三道印子",
+                    usage={},
+                )
+
+        rt = self._rt()
+        rt.provider = Provider()
+        result = asyncio.run(rt._do_proactive("g"))
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            rt.sender.calls,
+            ["我今天修了个小装置，结果把螺丝拧出三道印子"],
+        )
+
+    def test_proactive_skips_when_still_incomplete(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        calls = []
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                calls.append(messages)
+                return SimpleNamespace(text="结果把螺丝拧出", usage={})
+
+        rt = self._rt()
+        rt.provider = Provider()
+        result = asyncio.run(rt._do_proactive("g"))
+        self.assertFalse(result)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(rt.sender.calls, [])
+
+    def test_proactive_retries_on_length_finish(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        calls = []
+
+        class Provider:
+            id = "openai"
+
+            async def complete(self, messages, **kw):
+                calls.append(messages)
+                if len(calls) == 1:
+                    return SimpleNamespace(
+                        text="今天天气不错",
+                        finish_reason="length",
+                        usage={},
+                    )
+                return SimpleNamespace(
+                    text="今天天气不错，适合出去走走",
+                    finish_reason="stop",
+                    usage={},
+                )
+
+        rt = self._rt()
+        rt.provider = Provider()
+        result = asyncio.run(rt._do_proactive("g"))
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(rt.sender.calls, ["今天天气不错，适合出去走走"])
+
     def _rt(self, **cfg_kw):
         import pathlib
         import tempfile
@@ -4226,7 +4307,7 @@ class TestBatchFeatures(unittest.TestCase):
         self.assertEqual(mem.bump_turn("g", "chat"), 2)
         mem.reset_turn("g", "chat")
         self.assertEqual(mem.get_turn("g", "chat"), 0)
-        history = [{"role": "assistant", "content": "您好，请问有什么可以帮您？"}]
+        history = [{"role": "assistant", "content": "您好，请问需要什么帮助？"}]
         note = asyncio.run(enabled._persona_check(msg, "chat", history))
         self.assertIn("客服腔", note)
         reports = enabled.persona_mem().reports()
@@ -4362,8 +4443,8 @@ class TestBatchFeatures(unittest.TestCase):
         self.assertEqual(mem.get_turn("g", "chat"), 0)
 
         rt.cfg.persona_check_interval = 1
-        rt._remember_assistant("g", "您好，请问有什么可以帮您？")
-        rt.store.append_turn("g", "m1", "在吗", "您好，请问有什么可以帮您？")
+        rt._remember_assistant("g", "您好，请问需要什么帮助？")
+        rt.store.append_turn("g", "m1", "在吗", "您好，请问需要什么帮助？")
 
         async def run_bg_and_manual():
             rt._maybe_persona_check("g", "chat")
@@ -4417,13 +4498,13 @@ class TestBatchFeatures(unittest.TestCase):
 
         rt = self._rt(persona_guard_enabled=True)
         rt.provider = Broken()
-        rt.store.append_turn("g", "m", "在吗", "您好，请问有什么可以帮您？")
+        rt.store.append_turn("g", "m", "在吗", "您好，请问需要什么帮助？")
         msg = GroupMessage("g", "m", "member", "id", "在吗", "", 0)
         note = asyncio.run(
             rt._persona_check(
                 msg,
                 "chat",
-                [{"role": "assistant", "content": "您好，请问有什么可以帮您？"}],
+                [{"role": "assistant", "content": "您好，请问需要什么帮助？"}],
             )
         )
         self.assertEqual(note, "")
@@ -4487,11 +4568,11 @@ class TestBatchFeatures(unittest.TestCase):
                 )
 
         tail = "结尾标记：不要出现这句话"
-        negative = "不要客服腔。不要用表情。" + "不要啰嗦。" * 120 + tail
+        negative = "不要客套腔。不要用表情。" + "不要啰嗦。" * 120 + tail
         self.assertGreater(len(negative), 600)
         rt = self._rt(
             persona_guard_enabled=True,
-            persona_anchor="说话短。不要客服腔。",
+            persona_anchor="说话短。不要客套腔。",
             negative_prompt=negative,
         )
         rt.provider = Provider()
@@ -4507,7 +4588,7 @@ class TestBatchFeatures(unittest.TestCase):
         self.assertIn("【检查清单】", user)
         for index, item in enumerate(prompts.PERSONA_CHECK_ITEMS, 1):
             self.assertIn(f"{index}. {item}", user)
-        self.assertIn("【人设锚点】\n说话短。不要客服腔。", user)
+        self.assertIn("【人设锚点】\n说话短。不要客套腔。", user)
 
     def test_persona_check_checklist_is_generic(self):
         import asyncio
@@ -4616,7 +4697,7 @@ class TestBatchFeatures(unittest.TestCase):
         rt = self._rt()
         status, note, weight = rt._parse_checklist_report(
             "- 违反第1条：回复 63 字，超过 50 字上限｜一般\n"
-            "- 违反第2条：出现客服腔，原文「有什么可以帮您」｜严重\n"
+            "- 违反第2条：出现客服腔，原文「需要什么帮助」｜严重\n"
             "- 违反第2条：同一问题重复出现｜轻微"
         )
         self.assertEqual(status, "drift")
@@ -4637,13 +4718,13 @@ class TestBatchFeatures(unittest.TestCase):
 
             async def complete(self, messages, **kw):
                 return SimpleNamespace(
-                    text="- 违反第2条：用了客服腔，原文「有什么可以帮您」｜一般",
+                    text="- 违反第2条：用了客服腔，原文「需要什么帮助」｜一般",
                     usage={},
                 )
 
         rt = self._rt(
             persona_guard_enabled=True,
-            persona_anchor="说话短。不要客服腔。",
+            persona_anchor="说话短。不要客套腔。",
         )
         rt.provider = Provider()
         result = asyncio.run(
@@ -4653,7 +4734,7 @@ class TestBatchFeatures(unittest.TestCase):
                 [
                     {
                         "role": "assistant",
-                        "content": "您好，请问有什么可以帮您？",
+                        "content": "您好，请问需要什么帮助？",
                     }
                 ],
             )
